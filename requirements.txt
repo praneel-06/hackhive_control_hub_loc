@@ -1,0 +1,7 @@
+shapely>=2.0
+numpy
+scipy
+networkx
+matplotlib
+geopandas
+opencv-python-headless
