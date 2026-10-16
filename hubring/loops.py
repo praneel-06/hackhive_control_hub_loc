@@ -37,9 +37,11 @@ from .routing import BEND_COST, RouteTable, route_table, state_graph_parts, stat
 # turn[e, s]: cost of arriving with heading e and leaving with heading s.
 TURN = BEND_COST * (1 - np.eye(4))
 W_OVERLAP_PEN, W_CROSS_PEN = 1.0, 5.0   # match J's weights for overlap and crossings
-KEEP_TOP = 4          # orders re-routed collision-aware and rescored exactly per group
+KEEP_TOP = None       # orders re-routed collision-aware per group (None = all; 4 before chunk 3)
 EPS = 1e-9            # stand-in for a zero-cost edge (scipy drops explicit zeros)
 BLOCKED = 1e9         # weight of a move that must not be taken
+RIPUP_MAX_PASSES = 4  # rip-up-and-reroute passes per ring, stopping early when J stops improving
+PENALTY_GROWTH = 2.0  # collision penalties are multiplied by this each pass (negotiated congestion)
 
 
 @dataclass
@@ -93,13 +95,13 @@ class RingRouter:
         return used_e, used_p
 
     def route(self, a_pt: int, b_pt: int, start_cost: np.ndarray, end_cost: np.ndarray,
-              used_e: np.ndarray, used_p: np.ndarray):
+              used_e: np.ndarray, used_p: np.ndarray, scale: float = 1.0):
         """Cheapest leg a→b with penalties. start_cost[s]: extra cost of
         leaving with heading s; end_cost[e]: of arriving with heading e.
         Returns (penalised cost, state path)."""
         pr = self.parts
-        w = (pr.move_len * (1 + W_OVERLAP_PEN * used_e[pr.move_edge])
-             + W_CROSS_PEN * (used_p[pr.move_dst] > 0))
+        w = (pr.move_len * (1 + scale * W_OVERLAP_PEN * used_e[pr.move_edge])
+             + scale * W_CROSS_PEN * (used_p[pr.move_dst] > 0))
         if self.block_nodes:
             # safer retry: never pass through a device/hub point mid-leg. Off by
             # default: measured worse J and more crossings, and place_hub already
@@ -119,8 +121,19 @@ class RingRouter:
             path.append(int(pred[path[-1]]))
         return float(tot[e]), path[::-1]
 
-    def ring(self, order_pts: list[int], passes: int = 1):
-        """Route a closed loop through order_pts. Returns list of state paths."""
+    def _J(self, paths) -> float:
+        legs = [states_to_polyline(self.grid, p) for p in paths]
+        ring = np.vstack([legs[0]] + [lg[1:] for lg in legs[1:]])
+        return measure([ring], exempt_points=self.grid.pts[self.exempt]).J
+
+    def ring(self, order_pts: list[int], passes: int | None = None):
+        """Route a closed loop through order_pts. Returns list of state paths.
+
+        After the first sequential routing, each pass rips up every leg in turn
+        and re-routes it against the others with penalties multiplied by
+        PENALTY_GROWTH per pass. The ring with the lowest exact J is kept; the
+        passes stop as soon as one does not improve it."""
+        passes = RIPUP_MAX_PASSES if passes is None else passes
         k = len(order_pts)
         paths: list = [None] * k
         zero = np.zeros(4)
@@ -132,16 +145,22 @@ class RingRouter:
             _, paths[i] = self.route(order_pts[i], order_pts[(i + 1) % k], start, end, used_e, used_p)
             if paths[i] is None:
                 return None
-        for _ in range(passes):                            # rip up and reroute each leg
+        best, best_J = list(paths), self._J(paths)
+        for p in range(passes):                            # rip up and reroute each leg
+            scale = PENALTY_GROWTH ** p
             for i in range(k):
                 others = [paths[j] for j in range(k) if j != i]
                 used_e, used_p = self.usage(others)
                 start = TURN[paths[i - 1][-1] % 4]
                 end = TURN[:, paths[(i + 1) % k][0] % 4]
-                _, new = self.route(order_pts[i], order_pts[(i + 1) % k], start, end, used_e, used_p)
+                _, new = self.route(order_pts[i], order_pts[(i + 1) % k], start, end, used_e, used_p, scale)
                 if new is not None:
                     paths[i] = new
-        return paths
+            J = self._J(paths)
+            if J >= best_J - 1e-9:
+                break
+            best, best_J = list(paths), J
+        return best
 
 
 def visiting_orders(k: int):

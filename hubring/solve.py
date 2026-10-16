@@ -99,11 +99,12 @@ class Solution:
         return bool(self.checks) and all(v is True for v in self.checks.values())
 
 
-def hub_region(plan: Plan, group: Group, devices: np.ndarray | None = None):
-    """Where this group's hub may sit: its rooms, ≥ 0.5 m from walls/windows
-    and ≥ MIN_HUB_NODE_M from every device point."""
+def hub_region(plan: Plan, group: Group, devices: np.ndarray | None = None,
+               clearance: float = HUB_CLEARANCE_M):
+    """Where this group's hub may sit: its rooms, ≥ clearance (0.5 m) from
+    walls/windows and ≥ MIN_HUB_NODE_M from every device point."""
     zone = _union([plan.rooms[i].poly for i in group.rooms])
-    blocked = plan.walls_win.buffer(HUB_CLEARANCE_M)
+    blocked = plan.walls_win.buffer(clearance) if clearance > 0 else plan.walls_win
     if devices is not None and len(devices):
         # vertices of the buffered circle sit on the axes at exactly MIN_HUB_NODE_M,
         # so a hub straight out from a device at that distance stays legal
@@ -137,6 +138,42 @@ def _reanchor(ring: np.ndarray, hub: np.ndarray, seg: int) -> np.ndarray:
     return np.vstack([pts[k:], pts[:k], pts[k:k + 1]])
 
 
+def _on_loop(group: Group, region, nodes: np.ndarray, method: str = "on-loop",
+             clearance: float = HUB_CLEARANCE_M) -> Ring | None:
+    """Best hub on a straight stretch of one of the group's loops (adds no cost)."""
+    best = None
+    for lp in group.loops:
+        if lp.degenerate:
+            continue
+        hit = _longest_clear_stretch(lp.ring, region, nodes)
+        if hit is None:
+            continue
+        hub, seg = hit
+        ring = _reanchor(lp.ring, hub, seg)
+        if not _stops_once(ring, nodes):
+            continue
+        m = measure([ring], exempt_points=np.vstack([nodes, hub]))
+        cand = Ring(group, lp.order, tuple(hub), ring, m, method, clearance)
+        if best is None or cand.J < best.J:
+            best = cand
+    return best
+
+
+RELAXED_CLEARANCES_M = (0.4, 0.3, 0.2, 0.1, 0.05, 0.0)
+
+
+def _relaxed_on_loop(plan: Plan, grid: Grid, group: Group) -> Ring | None:
+    """Multi-device zone with no spot 0.5 m from the walls (tiny or
+    scale-broken plans): hub on the loop at the largest wall clearance that
+    fits, still ≥ MIN_HUB_NODE_M from every device. Flagged via hub_clearance."""
+    nodes = grid.pts[grid.node_pt[list(group.rooms)]]
+    for c in RELAXED_CLEARANCES_M:
+        hit = _on_loop(group, hub_region(plan, group, grid.pts[grid.node_pt], c), nodes, "relaxed", c)
+        if hit is not None:
+            return hit
+    return None
+
+
 def _stops_once(ring: np.ndarray, nodes: np.ndarray) -> bool:
     """Every own node is a stop of the ring exactly once."""
     return all(int((np.abs(ring[:-1] - xy).max(axis=1) <= TOL).sum()) == 1 for xy in nodes)
@@ -146,22 +183,9 @@ def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CA
               block_nodes: bool = False) -> Ring | None:
     region = hub_region(plan, group, grid.pts[grid.node_pt])
     nodes = grid.pts[grid.node_pt[list(group.rooms)]]
-    best: Ring | None = None
 
     # (1) free placement on the loop itself
-    for lp in group.loops:
-        if lp.degenerate:
-            continue
-        hit = _longest_clear_stretch(lp.ring, region, nodes)
-        if hit is not None:
-            hub, seg = hit
-            ring = _reanchor(lp.ring, hub, seg)
-            if not _stops_once(ring, nodes):
-                continue
-            m = measure([ring], exempt_points=np.vstack([nodes, hub]))
-            cand = Ring(group, lp.order, tuple(hub), ring, m, "on-loop")
-            if best is None or cand.J < best.J:
-                best = cand
+    best = _on_loop(group, region, nodes)
     if best is not None:
         return best
 
@@ -172,7 +196,7 @@ def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CA
     near_node = np.linalg.norm(grid.pts[ok][:, None, :] - grid.pts[grid.node_pt][None, :, :], axis=2).min(axis=1)
     ok = ok[near_node >= MIN_HUB_NODE_M - HUB_SLACK_M]
     if len(ok) == 0:
-        return _micro_hub(plan, grid, group) if group.n_devices == 1 else None
+        return _micro_hub(plan, grid, group) if group.n_devices == 1 else _relaxed_on_loop(plan, grid, group)
 
     # (2) one device: hub on a grid point straight out from the node, ring
     #     hub → node → hub, J = 3d + 1 (L 2d, O d, 2 reversals). Any other ring
@@ -425,14 +449,14 @@ def _attempt(plan: Plan, cfg: Config, t0: float, log: list[str]) -> tuple[Soluti
 
     def pick(pool: dict[int, Ring]):
         # micro hubs break the 0.5 m hub rule (flagged), so only when nothing else covers the plan
-        strict = {m: rg for m, rg in pool.items() if rg.hub_method != "micro"}
+        strict = {m: rg for m, rg in pool.items() if rg.hub_clearance >= HUB_CLEARANCE_M}
         chosen = choose_groups(groups, strict, n)
         if chosen is None and len(strict) < len(pool):
             chosen = choose_groups(groups, pool, n)
         return chosen
 
     build(useful)
-    chosen = choose_groups(groups, {m: rg for m, rg in rings.items() if rg.hub_method != "micro"}, n)
+    chosen = choose_groups(groups, {m: rg for m, rg in rings.items() if rg.hub_clearance >= HUB_CLEARANCE_M}, n)
     if chosen is None or len(chosen) > (h_min or 0):
         build(groups)
         chosen = pick(rings)
@@ -490,7 +514,7 @@ def solve_plan(raw: dict, time_limit: float = TIME_LIMIT_S) -> Solution:
     if not best.valid:
         best.fallback, best.status = len(FALLBACK_LEVELS) - 1, "partial"
     best.log = log + plan.flags + [
-        f"{rg.group.room_ids[0]}: hub clearance only {rg.hub_clearance:.2f} m (micro hub, room too narrow)"
+        f"{'+'.join(rg.group.room_ids)}: hub clearance only {rg.hub_clearance:.2f} m ({rg.hub_method} hub, rooms too narrow)"
         for rg in best.rings if rg.hub_clearance < HUB_CLEARANCE_M]
     best.seconds = time.perf_counter() - t0
     return best

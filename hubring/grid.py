@@ -15,10 +15,13 @@ from shapely.geometry import MultiPolygon, Polygon
 
 from .plan import MIN_HUB_NODE_M, Plan
 
-WALL_OFFSET_M = 0.15   # run cable this far inside a room's wall
+WALL_OFFSET_M = 0.05   # run cable this far inside a room's wall (0.15 before chunk 3)
 FILL_SPACING_M = 1.0   # max gap between grid lines in open areas
 MERGE_M = 0.05         # lines closer than this merge into one
 DOOR_LANE_M = 0.15     # side lanes either side of a door centre line
+DOOR_EDGE_M = 0.05     # extra lanes this far inside each door jamb (None = off)
+HUB_LINES = True       # lines MIN_HUB_NODE_M either side of every device
+SHORT_EDGES = True     # wall lines also for room edges shorter than 2·WALL_OFFSET_M (corners, jogs)
 
 # Line priorities: when two lines merge, the higher one keeps its position.
 PRI_NODE, PRI_DOOR, PRI_HUB, PRI_WALL, PRI_FILL = 3, 2, 1.5, 1, 0
@@ -45,12 +48,13 @@ def _room_wall_lines(poly) -> tuple[list[float], list[float]]:
         c = np.asarray(p.exterior.coords)
         for (x0, y0), (x1, y1) in zip(c[:-1], c[1:]):
             mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-            if abs(x0 - x1) < 1e-6 and abs(y1 - y0) > 2 * WALL_OFFSET_M:   # vertical edge
+            min_len = 1e-3 if SHORT_EDGES else 2 * WALL_OFFSET_M
+            if abs(x0 - x1) < 1e-6 and abs(y1 - y0) > min_len:   # vertical edge
                 for s in (1, -1):
                     if p.contains(shapely.Point(mx + s * WALL_OFFSET_M, my)):
                         xs.append(x0 + s * WALL_OFFSET_M)
                         break
-            elif abs(y0 - y1) < 1e-6 and abs(x1 - x0) > 2 * WALL_OFFSET_M:  # horizontal edge
+            elif abs(y0 - y1) < 1e-6 and abs(x1 - x0) > min_len:  # horizontal edge
                 for s in (1, -1):
                     if p.contains(shapely.Point(mx, my + s * WALL_OFFSET_M)):
                         ys.append(y0 + s * WALL_OFFSET_M)
@@ -88,7 +92,7 @@ def build_grid(plan: Plan, fill: float = FILL_SPACING_M) -> Grid:
         yl.append((r.node[1], PRI_NODE))
         # lines MIN_HUB_NODE_M either side of the node: the closest legal hub spot
         # for a one-device zone (hub → node → hub out and back)
-        for sgn in (-1, 1):
+        for sgn in (-1, 1) if HUB_LINES else ():
             xl.append((r.node[0] + sgn * MIN_HUB_NODE_M, PRI_HUB))
             yl.append((r.node[1] + sgn * MIN_HUB_NODE_M, PRI_HUB))
         wx, wy = _room_wall_lines(r.poly)
@@ -104,9 +108,13 @@ def build_grid(plan: Plan, fill: float = FILL_SPACING_M) -> Grid:
         if bx1 - bx0 >= by1 - by0:      # door in a horizontal wall: cable crosses vertically
             lane = min(DOOR_LANE_M, 0.3 * (bx1 - bx0))
             xl += [(c.x - lane, PRI_DOOR), (c.x + lane, PRI_DOOR)]
+            if DOOR_EDGE_M and bx1 - bx0 > 4 * DOOR_EDGE_M:
+                xl += [(bx0 + DOOR_EDGE_M, PRI_WALL), (bx1 - DOOR_EDGE_M, PRI_WALL)]
         else:
             lane = min(DOOR_LANE_M, 0.3 * (by1 - by0))
             yl += [(c.y - lane, PRI_DOOR), (c.y + lane, PRI_DOOR)]
+            if DOOR_EDGE_M and by1 - by0 > 4 * DOOR_EDGE_M:
+                yl += [(by0 + DOOR_EDGE_M, PRI_WALL), (by1 - DOOR_EDGE_M, PRI_WALL)]
 
     x0, y0, x1, y1 = plan.inner.bounds
     xs = _merge(xl, x0, x1, fill)
