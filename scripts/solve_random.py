@@ -1,7 +1,7 @@
 """Read-only: solve random plans end to end, report crashes and failed checks."""
 import collections, json, pickle, random, sys, time, traceback
 import numpy as np
-sys.path.insert(0, "/Users/praneelchetlapalli/control_hub_proj")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 from hubring.plan import RESPLAN_DIR, build_plan
 from hubring.solve import solve_plan
 

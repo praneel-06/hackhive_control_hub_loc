@@ -2,7 +2,7 @@
 import collections, json, pickle, random, sys, time
 import numpy as np, networkx as nx, shapely
 from shapely.geometry import Point, MultiPolygon
-sys.path.insert(0, "/Users/praneelchetlapalli/control_hub_proj")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 from hubring.plan import build_plan, RESPLAN_DIR
 from hubring.grid import build_grid
 from hubring.groups import room_adjacency, enumerate_groups, min_hubs, hub_lower_bound
