@@ -19,7 +19,11 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import multiprocessing as mp
+import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from shapely.geometry import MultiPolygon, Polygon
@@ -30,8 +34,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 warnings.filterwarnings("ignore")
 
 from hubring.groups import room_adjacency                      # noqa: E402
-from hubring.plan import RESPLAN_DIR, load_plans                # noqa: E402
-from hubring.solve import FALLBACK_LEVELS, solve_plan, to_json  # noqa: E402
+from hubring.plan import RESPLAN_DIR, DeviceError, load_plans   # noqa: E402
+from hubring.solve import FALLBACK_LEVELS, solve_plan, to_json, top_solutions  # noqa: E402
 
 PHASE_DIR = ROOT / "out" / "ui_phases"
 PHASES = [
@@ -101,10 +105,22 @@ def _names(rooms) -> list[str]:
     return names
 
 
-def _payload(raw: dict) -> dict:
+def _nodes(body) -> dict | None:
+    nodes = (body or {}).get("nodes") or {}
+    return {int(k): (float(v[0]), float(v[1])) for k, v in nodes.items()} or None
+
+
+def _solve(raw, nodes):
+    try:
+        return solve_plan(raw, nodes=nodes)
+    except DeviceError as e:
+        raise HTTPException(400, str(e))
+
+
+def _payload(raw: dict, nodes: dict | None = None, sol=None) -> dict:
     t0 = time.perf_counter()
-    sol = solve_plan(raw)
-    solve_s = time.perf_counter() - t0
+    sol = sol or _solve(raw, nodes)
+    solve_s = sol.seconds if sol.seconds else time.perf_counter() - t0
     plan = sol.plan
     names = _names(plan.rooms)
     zone_of = {r: k for k, rg in enumerate(sol.rings) for r in rg.order}
@@ -172,10 +188,103 @@ def solve(pid: int):
     return JSONResponse(_payload(_raw(pid)))
 
 
-@app.get("/api/export/{pid}")
-def export(pid: int):
-    sol = solve_plan(_raw(pid))
-    return JSONResponse(to_json(sol), headers={"Content-Disposition": f'attachment; filename="plan_{pid}_solution.json"'})
+@app.post("/api/solve/{pid}")
+def solve_moved(pid: int, body: dict = Body(default={})):
+    """Solve with some devices moved by the user: {"nodes": {room_index: [x, y]}} in metres."""
+    return JSONResponse(_payload(_raw(pid), _nodes(body)))
+
+
+@app.post("/api/export/{pid}")
+def export(pid: int, body: dict = Body(default={})):
+    return JSONResponse(to_json(_solve(_raw(pid), _nodes(body))))
+
+
+@app.post("/api/top3/{pid}")
+def top3(pid: int, body: dict = Body(default={})):
+    raw, nodes = _raw(pid), _nodes(body)
+    t0 = time.perf_counter()
+    try:
+        sols = top_solutions(raw, k=3, nodes=nodes)
+    except DeviceError as e:
+        raise HTTPException(400, str(e))
+    for s_ in sols:
+        s_.seconds = 0.0
+    return {"seconds": time.perf_counter() - t0, "options": [_payload(raw, sol=s_) for s_ in sols]}
+
+
+# ---------------------------------------------------------------- batch jobs
+JOBS: dict[str, dict] = {}
+_pool: ProcessPoolExecutor | None = None
+
+
+def _get_pool() -> ProcessPoolExecutor:
+    global _pool
+    if _pool is None:
+        from solve_parallel import _init
+        _pool = ProcessPoolExecutor(mp.cpu_count(), mp_context=mp.get_context("spawn"),
+                                    initializer=_init, initargs=(60,))
+    return _pool
+
+
+def _summary(rows: list[dict]) -> dict:
+    st = Counter(r["status"] for r in rows)
+    ok = [r for r in rows if r["status"] == "valid"]
+    feas = len(rows) - st["infeasible"]
+    t = np.array([r["s"] for r in rows]) if rows else np.zeros(1)
+    out = {"done": len(rows), "status": dict(st), "valid_pct": 100 * len(ok) / feas if feas else None,
+           "time_median": float(np.median(t)), "time_p95": float(np.percentile(t, 95)), "time_max": float(t.max())}
+    if ok:
+        H = np.array([r["H"] for r in ok]); J = np.array([r["J"] for r in ok]); X = np.array([r["X"] for r in ok])
+        out.update(hubs_mean=float(H.mean()), at_lower_bound_pct=float(100 * np.mean(H == [r["lb"] for r in ok])),
+                   J_median=float(np.median(J)), J_mean=float(J.mean()), J_p90=float(np.percentile(J, 90)),
+                   X_total=int(X.sum()), X_plans=int((X > 0).sum()),
+                   J_hist=np.histogram(J, bins=20)[0].tolist(), J_edges=np.histogram(J, bins=20)[1].tolist())
+    return out
+
+
+def _run_job(job: dict, raws: list[dict]):
+    from solve_parallel import _solve_one
+    pool = _get_pool()
+    t0 = time.perf_counter()
+    futs = [pool.submit(_solve_one, r) for r in raws]
+    for f in as_completed(futs):
+        try:
+            row = f.result()
+        except Exception as e:
+            row = {"id": -1, "status": "crash", "s": 0.0, "error": str(e)}
+        row.pop("log", None)
+        job["rows"].append(row)
+        job["elapsed"] = time.perf_counter() - t0
+    job["running"] = False
+
+
+@app.post("/api/batch")
+def batch(body: dict = Body(default={})):
+    n, seed = body.get("n", 100), int(body.get("seed", 11))
+    pool_ids = sorted(PLANS)
+    if n == "all":
+        ids = pool_ids
+    else:
+        n = max(1, min(int(n), len(pool_ids)))
+        ids = random.Random(seed).sample(pool_ids, n)
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = job = {"id": job_id, "total": len(ids), "rows": [], "running": True, "elapsed": 0.0,
+                          "workers": mp.cpu_count(), "seed": seed}
+    threading.Thread(target=_run_job, args=(job, [PLANS[i] for i in ids]), daemon=True).start()
+    return {"job": job_id, "total": len(ids)}
+
+
+@app.get("/api/batch/{job_id}")
+def batch_status(job_id: str, rows: bool = False):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown batch job")
+    rws = list(job["rows"])
+    out = {k: job[k] for k in ("id", "total", "running", "elapsed", "workers", "seed")}
+    out["summary"] = _summary(rws)
+    if rows:
+        out["rows"] = rws
+    return out
 
 
 @app.post("/api/upload")

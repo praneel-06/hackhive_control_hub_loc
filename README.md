@@ -79,11 +79,20 @@ For the full 17,000-plan set, download `ResPlan.pkl` from Kaggle
 .venv/bin/python -m uvicorn app.server:app --port 8000    # then open http://localhost:8000
 ```
 
-Pick a plan ID (or Random, or load a ResPlan `.pkl`) and press Solve: the plan
-is drawn with zones, rings, hubs and devices; hover any room or ring for its
-numbers. Layers switch the routing grid and room graph on, the right panel shows
-hubs vs. the lower bound, J and its parts, all 12 rule checks and one row per
-hub, and "Show phases 0 → 9" steps through every phase's diagram for that plan.
+- **Plan view:** pick a plan ID (or Random, or load a ResPlan `.pkl`) and press
+  Solve. Zones, rings, hubs and devices are drawn; hover any room or ring for its
+  numbers; layers switch the routing grid and room graph on. The right panel shows
+  hubs vs. the lower bound, J and its parts, all 12 rule checks and one row per hub.
+- **Drag a device** to a new spot: the plan re-solves on release and shows the
+  change in J and hubs; positions that break a rule (outside the room, < 0.5 m from
+  a wall) are refused and the device moves back. "Reset devices" restores ours.
+- **Compare top 3 groupings:** the three best ways to split the rooms into hub
+  zones, side by side, ranked by hubs then J (`hubring.solve.top_solutions`).
+- **Show phases 0 → 9:** every phase's diagram for the current plan.
+- **Batch view:** solve 100 / 500 / 1,000 / all plans on every core with live
+  progress, metric tiles (valid %, hubs and share at the minimum, J, crossings,
+  time per plan), a J histogram and a sortable table; click a row to open the plan.
+
 The full `ResPlan.pkl` (if present) loads in the background; the 300-plan
 sample is available at once.
 

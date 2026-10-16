@@ -476,11 +476,13 @@ def _attempt(plan: Plan, cfg: Config, t0: float, log: list[str]) -> tuple[Soluti
     return sol, sub
 
 
-def solve_plan(raw: dict, time_limit: float = TIME_LIMIT_S) -> Solution:
+def solve_plan(raw: dict, time_limit: float = TIME_LIMIT_S,
+               nodes: dict[int, tuple[float, float]] | None = None) -> Solution:
     """Solve one plan, walking down the fallback ladder until a result passes
-    every hard rule. Never raises for a plan that builds; check .status."""
+    every hard rule. Never raises for a plan that builds; check .status.
+    nodes: optional device positions replacing ours (see build_plan)."""
     t0 = time.perf_counter()
-    plan = build_plan(raw)
+    plan = build_plan(raw, nodes=nodes)
     big = [r.id for r in plan.rooms if r.area > MAX_AREA_M2 + AREA_TOL_M2]
     # ResPlan sometimes labels a sliver of wall as a room: no free space inside, no cable can reach it
     walled = [r.id for r in plan.rooms
@@ -518,6 +520,62 @@ def solve_plan(raw: dict, time_limit: float = TIME_LIMIT_S) -> Solution:
         for rg in best.rings if rg.hub_clearance < HUB_CLEARANCE_M]
     best.seconds = time.perf_counter() - t0
     return best
+
+
+MAX_COVERS = 50_000     # safety cap on enumerated groupings in top_solutions
+
+
+def top_solutions(raw: dict, k: int = 3, nodes: dict | None = None) -> list[Solution]:
+    """The k best groupings (for the UI): every exact cover of the rooms by
+    zones whose ring passes every per-ring rule, ranked like choose_groups
+    (fewest hubs, then lowest J, then most even area). Rings are built for
+    every legal zone, not only fewest-hub ones, so alternatives may use more
+    hubs. [] if the plan has no valid answer."""
+    t0 = time.perf_counter()
+    plan = build_plan(raw, nodes=nodes)
+    if any(r.area > MAX_AREA_M2 + AREA_TOL_M2 for r in plan.rooms):
+        return []
+    grid = build_grid(plan)
+    adj = room_adjacency(plan, grid)
+    groups = enumerate_groups(plan, adj)
+    solve_all(groups, grid, restrict=True)
+    checker = Checker(plan, grid, adj)
+    rings: dict[int, Ring] = {}
+    for g in groups:
+        try:
+            rg = place_hub(plan, grid, g)
+        except Exception:
+            continue
+        if rg is not None and checker.ring_ok(rg):
+            rings[g.mask] = rg
+    n = len(plan.rooms)
+    by_low: dict[int, list[int]] = {}
+    for m in rings:
+        by_low.setdefault((m & -m).bit_length() - 1, []).append(m)
+    covers: list[tuple[int, ...]] = []
+
+    def rec(rem: int, acc: tuple[int, ...]):
+        if len(covers) >= MAX_COVERS:
+            return
+        if rem == 0:
+            covers.append(acc)
+            return
+        low = (rem & -rem).bit_length() - 1
+        for m in by_low.get(low, ()):
+            if m & rem == m:
+                rec(rem ^ m, acc + (m,))
+
+    rec((1 << n) - 1, ())
+    flagged = lambda c: sum(rings[m].hub_clearance < HUB_CLEARANCE_M for m in c)
+    key = lambda c: (flagged(c) > 0, len(c), sum(rings[m].J for m in c),
+                     float(np.ptp([rings[m].group.area for m in c])))
+    out = []
+    for c in sorted(covers, key=key)[:k]:
+        sol = _finish(plan, grid, [rings[m] for m in c], checker, t0)
+        sol.grid, sol.lower_bound = grid, hub_lower_bound(plan)
+        sol.log = plan.flags[:]
+        out.append(sol)
+    return out
 
 
 def to_json(sol: Solution) -> dict:

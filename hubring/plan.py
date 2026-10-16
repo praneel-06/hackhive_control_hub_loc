@@ -176,11 +176,19 @@ def _carve_overlaps(shapes: list[tuple[str, str, Polygon]]) -> list[tuple[str, s
     return out
 
 
-def build_plan(raw: dict, exclude_from_free: bool = True) -> Plan:
+class DeviceError(ValueError):
+    """A user-supplied device position breaks a rule (outside its room, < 0.5 m from a wall)."""
+
+
+def build_plan(raw: dict, exclude_from_free: bool = True,
+               nodes: dict[int, tuple[float, float]] | None = None) -> Plan:
     """Parse one ResPlan dict into a metre-scale Plan.
 
     exclude_from_free: if True, cable may not run through excluded rooms
     (bathroom, balcony, ...). Open question for the organisers.
+    nodes: optional {room index: (x, y) metres} device positions that replace
+    ours (UI drag). Each must lie in its room, in free space, ≥ 0.5 m from
+    walls and windows, else DeviceError.
     """
     raw = normalize_keys(dict(raw))
     scale = (raw["inner"].area / raw["area"]) ** 0.5
@@ -231,6 +239,18 @@ def build_plan(raw: dict, exclude_from_free: bool = True) -> Plan:
         r.node, r.clearance = place_node(r.poly, plan.free, walls_win)
         if r.clearance < NODE_CLEARANCE_M:
             plan.flags.append(f"{r.id}: node clearance only {r.clearance:.2f} m (room too narrow)")
+    for i, (x, y) in (nodes or {}).items():
+        if not 0 <= int(i) < len(rooms):
+            raise DeviceError(f"no eligible room #{i}")
+        r, pt = rooms[int(i)], shapely.Point(float(x), float(y))
+        if not r.poly.covers(pt):
+            raise DeviceError(f"{r.id}: device must stay inside its room")
+        if not plan.free.covers(pt):
+            raise DeviceError(f"{r.id}: device is not in usable floor space")
+        d = walls_win.distance(pt)
+        if d < NODE_CLEARANCE_M - 1e-9:
+            raise DeviceError(f"{r.id}: device is {d:.2f} m from a wall or window (needs ≥ 0.5 m)")
+        r.node, r.clearance = (float(x), float(y)), NODE_CLEARANCE_M
     return plan
 
 
