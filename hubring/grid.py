@@ -58,13 +58,15 @@ def _room_wall_lines(poly) -> tuple[list[float], list[float]]:
     return xs, ys
 
 
-def _merge(lines: list[tuple[float, int]], lo: float, hi: float) -> np.ndarray:
+def _merge(lines: list[tuple[float, int]], lo: float, hi: float,
+           fill: float = FILL_SPACING_M) -> np.ndarray:
     """Merge near-duplicate lines (higher priority wins), then add fill lines
     so no gap exceeds FILL_SPACING_M."""
     lines = sorted(lines)
     kept: list[tuple[float, int]] = []
     for v, pri in lines:
-        if kept and v - kept[-1][0] < MERGE_M:
+        # two node lines never merge: each node must stay an exact grid point
+        if kept and v - kept[-1][0] < MERGE_M and not (pri == kept[-1][1] == PRI_NODE):
             if pri > kept[-1][1]:
                 kept[-1] = (v, pri)
             continue
@@ -73,12 +75,12 @@ def _merge(lines: list[tuple[float, int]], lo: float, hi: float) -> np.ndarray:
     bounds = [lo] + vals + [hi]
     out = list(vals)
     for a, b in zip(bounds[:-1], bounds[1:]):
-        n = int(np.ceil((b - a) / FILL_SPACING_M)) - 1
+        n = int(np.ceil((b - a) / fill)) - 1
         out += list(np.linspace(a, b, n + 2)[1:-1]) if n > 0 else []
     return np.unique(np.round(out, 6))
 
 
-def build_grid(plan: Plan) -> Grid:
+def build_grid(plan: Plan, fill: float = FILL_SPACING_M) -> Grid:
     xl: list[tuple[float, int]] = []
     yl: list[tuple[float, int]] = []
     for r in plan.rooms:
@@ -102,8 +104,8 @@ def build_grid(plan: Plan) -> Grid:
             yl += [(c.y - lane, PRI_DOOR), (c.y + lane, PRI_DOOR)]
 
     x0, y0, x1, y1 = plan.inner.bounds
-    xs = _merge(xl, x0, x1)
-    ys = _merge(yl, y0, y1)
+    xs = _merge(xl, x0, x1, fill)
+    ys = _merge(yl, y0, y1, fill)
 
     # Candidate points: every intersection; keep those in free space.
     X, Y = np.meshgrid(xs, ys)                      # shape (ny, nx)
@@ -136,8 +138,8 @@ def build_grid(plan: Plan) -> Grid:
     room_of[pi] = ri
 
     lookup = {(round(x, 6), round(y, 6)): i for i, (x, y) in enumerate(pts)}
-    node_pt = np.array([lookup[(round(_snap(xs, r.node[0]), 6), round(_snap(ys, r.node[1]), 6))]
-                        for r in plan.rooms])
+    node_pt = np.array([_node_point(plan, i, xs, ys, pts, room_of, lookup)
+                        for i in range(len(plan.rooms))], dtype=np.int64)
 
     e = pairs[legal]
     return Grid(
@@ -152,3 +154,26 @@ def build_grid(plan: Plan) -> Grid:
 
 def _snap(lines: np.ndarray, v: float) -> float:
     return lines[np.argmin(np.abs(lines - v))]
+
+
+def _node_point(plan: Plan, i: int, xs, ys, pts, room_of, lookup) -> int:
+    """Grid point of room i's node. Normally the node's own line crossing; if
+    that crossing is not free (node lines merged, or a node in a wall sliver),
+    move the node to the nearest free grid point of its room, preferring
+    points that keep the clearance it was placed with."""
+    r = plan.rooms[i]
+    key = (round(_snap(xs, r.node[0]), 6), round(_snap(ys, r.node[1]), 6))
+    if key in lookup:
+        return lookup[key]
+    cand = np.flatnonzero(room_of == i)
+    if len(cand) == 0:
+        cand = np.arange(len(pts))
+    walls_win = plan.walls_win
+    clear = shapely.distance(walls_win, shapely.points(pts[cand]))
+    good = clear >= r.clearance - 1e-9
+    pool = cand[good] if good.any() else cand[clear >= clear.max() - 1e-9]
+    k = int(pool[np.argmin(np.abs(pts[pool] - r.node).sum(axis=1))])
+    plan.flags.append(f"{r.id}: node moved {np.abs(pts[k] - r.node).sum():.3f} m to a free grid point")
+    r.node = tuple(pts[k])
+    r.clearance = min(r.clearance, float(shapely.distance(walls_win, shapely.Point(pts[k]))))
+    return k

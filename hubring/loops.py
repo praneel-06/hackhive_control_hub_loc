@@ -39,6 +39,7 @@ TURN = BEND_COST * (1 - np.eye(4))
 W_OVERLAP_PEN, W_CROSS_PEN = 1.0, 5.0   # match J's weights for overlap and crossings
 KEEP_TOP = 4          # orders re-routed collision-aware and rescored exactly per group
 EPS = 1e-9            # stand-in for a zero-cost edge (scipy drops explicit zeros)
+BLOCKED = 1e9         # weight of a move that must not be taken
 
 
 @dataclass
@@ -66,8 +67,10 @@ class RingRouter:
     heading-state graph, so later legs avoid the lines and points that
     earlier legs of the same loop use."""
 
-    def __init__(self, grid: Grid, allowed: np.ndarray | None, exempt_pts: np.ndarray):
+    def __init__(self, grid: Grid, allowed: np.ndarray | None, exempt_pts: np.ndarray,
+                 block_nodes: bool = False):
         self.grid = grid
+        self.block_nodes = block_nodes
         self.parts = state_graph_parts(grid, allowed)
         self.P = len(grid.pts)
         self.exempt = np.zeros(self.P, bool)
@@ -97,6 +100,11 @@ class RingRouter:
         pr = self.parts
         w = (pr.move_len * (1 + W_OVERLAP_PEN * used_e[pr.move_edge])
              + W_CROSS_PEN * (used_p[pr.move_dst] > 0))
+        if self.block_nodes:
+            # safer retry: never pass through a device/hub point mid-leg. Off by
+            # default: measured worse J and more crossings, and place_hub already
+            # rejects rings that stop at a node twice.
+            w = w + BLOCKED * (self.exempt[pr.move_dst] & (pr.move_dst != b_pt))
         src = pr.n_states                                  # virtual start state
         extra = (np.full(4, src), a_pt * 4 + np.arange(4), start_cost + EPS, 1)
         G = pr.matrix(w, extra)
@@ -104,7 +112,7 @@ class RingRouter:
         tgt = b_pt * 4 + np.arange(4)
         tot = dist[tgt] + end_cost
         e = int(np.argmin(tot))
-        if not np.isfinite(tot[e]):
+        if not np.isfinite(tot[e]) or tot[e] >= BLOCKED:
             return np.inf, None
         path = [int(tgt[e])]
         while pred[path[-1]] != src:
@@ -185,11 +193,20 @@ def heading_dp(legs4: list[np.ndarray]) -> tuple[float, list[tuple[int, int]]]:
     return best
 
 
+def zone_allowed(grid: Grid, rooms) -> np.ndarray:
+    """Grid points a ring of this zone may use: its own rooms and door/opening
+    gaps, minus every other zone's device point (a cable must never touch a
+    foreign node, which a gap point shared by two zones could otherwise allow)."""
+    allowed = np.isin(grid.room_of, rooms) | (grid.room_of < 0)
+    foreign = np.setdiff1d(np.arange(len(grid.node_pt)), rooms)
+    allowed[grid.node_pt[foreign]] = False
+    return allowed
+
+
 def _legs_for(group: Group, grid: Grid, restrict: bool, shared: RouteTable | None):
     """Route table over this group's devices, local index i ↔ group.rooms[i]."""
     if restrict:
-        allowed = np.isin(grid.room_of, group.rooms) | (grid.room_of < 0)
-        return route_table(grid, allowed=allowed, nodes=np.array(group.rooms))
+        return route_table(grid, allowed=zone_allowed(grid, group.rooms), nodes=np.array(group.rooms))
     sub = np.array(group.rooms)
     rt = shared
     # View of the shared table restricted to the group's devices.
@@ -212,7 +229,8 @@ def _make_loop(rooms, heads, legs, dp_cost, nodes, method) -> Loop:
 
 
 def best_loops(group: Group, grid: Grid, restrict: bool = True,
-               shared: RouteTable | None = None, keep: int = KEEP_TOP) -> list[Loop]:
+               shared: RouteTable | None = None, keep: int | None = KEEP_TOP,
+               block_nodes: bool = False) -> list[Loop]:
     """Ranked loops for one group (best J first). Also stored on group.loops.
 
     restrict: route only through this group's rooms and door gaps, so loops
@@ -234,8 +252,8 @@ def best_loops(group: Group, grid: Grid, restrict: bool = True,
     scored.sort(key=lambda t: t[0])
 
     nodes = grid.pts[grid.node_pt[list(group.rooms)]]
-    allowed = (np.isin(grid.room_of, group.rooms) | (grid.room_of < 0)) if restrict else None
-    router = RingRouter(grid, allowed, grid.node_pt[list(group.rooms)])
+    allowed = zone_allowed(grid, group.rooms) if restrict else None
+    router = RingRouter(grid, allowed, grid.node_pt[list(group.rooms)], block_nodes)
     loops = []
     for cost, order, heads in scored[:keep]:
         rooms = tuple(group.rooms[i] for i in order)
@@ -253,8 +271,9 @@ def best_loops(group: Group, grid: Grid, restrict: bool = True,
     return loops
 
 
-def solve_all(groups: list[Group], grid: Grid, restrict: bool = True) -> None:
-    """Fill group.loops for every candidate group."""
+def solve_all(groups: list[Group], grid: Grid, restrict: bool = True, keep: int | None = KEEP_TOP,
+              block_nodes: bool = False) -> None:
+    """Fill group.loops for every candidate group (keep=None: all orders)."""
     shared = None if restrict else route_table(grid)
     for g in groups:
-        best_loops(g, grid, restrict=restrict, shared=shared)
+        best_loops(g, grid, restrict=restrict, shared=shared, keep=keep, block_nodes=block_nodes)

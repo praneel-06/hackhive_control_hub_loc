@@ -13,6 +13,18 @@ hub → N1 → … → Nk → hub is re-routed through each; the lowest J wins.
 Phase 4: a DP over room bitmasks picks groups covering every room exactly
 once with (fewest hubs, then lowest total J). Loops are restricted to their
 own group's rooms, so rings of different groups never meet and J adds up.
+
+Fallback ladder (solve_plan): only a plan that passes `validate` counts, so
+a failure at one level moves to the next instead of giving up:
+  0 normal           DP over every group's ring
+  1 next-best        DP over rings that pass every per-ring rule, which
+                     includes splitting a bad zone down to one room per hub
+  2 safer retry      finer grid, all visiting orders, more hub candidates,
+                     ring legs never pass through a device point
+  3 safer next-best
+  4 partial          nothing valid; best attempt returned, flagged, logged
+Exceptions inside one group's hub placement drop that group; exceptions in
+a whole attempt move to the next level.
 """
 from __future__ import annotations
 
@@ -24,17 +36,30 @@ import networkx as nx
 import numpy as np
 import shapely
 from shapely.geometry import LineString, Point
-from shapely.ops import unary_union
 
-from .grid import Grid, build_grid
-from .groups import Group, enumerate_groups, hub_lower_bound, room_adjacency
-from .loops import RingRouter, solve_all
+from .grid import FILL_SPACING_M, Grid, build_grid
+from .groups import AREA_TOL_M2, MAX_AREA_M2, Group, enumerate_groups, hub_lower_bound, room_adjacency
+from .loops import KEEP_TOP, RingRouter, solve_all, zone_allowed
 from .metrics import TOL, Metrics, measure
-from .plan import NODE_CLEARANCE_M, Plan, build_plan
+from .plan import NODE_CLEARANCE_M, Plan, _union, build_plan, safe_op
 from .routing import states_to_polyline
 
 HUB_CLEARANCE_M = 0.5
 N_HUB_CANDIDATES = 6
+TIME_LIMIT_S = 30.0     # soft budget per plan: no safer retry once a third of it is used
+
+
+@dataclass(frozen=True)
+class Config:
+    fill: float = FILL_SPACING_M          # grid fill spacing
+    keep: int | None = KEEP_TOP           # visiting orders re-routed per group (None = all)
+    hub_candidates: int = N_HUB_CANDIDATES
+    block_nodes: bool = False             # ring legs may not pass through any device/hub point
+
+
+NORMAL = Config()
+SAFER = Config(fill=0.5, keep=None, hub_candidates=4 * N_HUB_CANDIDATES, block_nodes=True)
+FALLBACK_LEVELS = ("normal", "next-best grouping", "safer retry", "safer next-best", "partial")
 
 
 @dataclass
@@ -44,7 +69,8 @@ class Ring:
     hub: tuple[float, float]     # metres
     ring: np.ndarray             # closed polyline from hub back to hub, metres
     metrics: Metrics
-    hub_method: str              # "on-loop" (free) or "rerouted"
+    hub_method: str              # "on-loop" (free), "rerouted" or "micro" (narrow room, flagged)
+    hub_clearance: float = HUB_CLEARANCE_M   # clearance the hub was placed with (< 0.5 m ⇒ flagged)
 
     @property
     def J(self) -> float:
@@ -58,6 +84,9 @@ class Solution:
     total: Metrics
     checks: dict = field(default_factory=dict)
     seconds: float = 0.0
+    fallback: int = 0                    # index into FALLBACK_LEVELS
+    status: str = "valid"                # "valid", "infeasible" (room > 100 m²), "partial"
+    log: list[str] = field(default_factory=list)
 
     @property
     def H(self) -> int:
@@ -70,9 +99,8 @@ class Solution:
 
 def hub_region(plan: Plan, group: Group):
     """Where this group's hub may sit: its rooms, ≥ 0.5 m from walls/windows."""
-    zone = unary_union([plan.rooms[i].poly for i in group.rooms])
-    blocked = unary_union([plan.walls, plan.windows]).buffer(HUB_CLEARANCE_M)
-    return zone.difference(blocked)
+    zone = _union([plan.rooms[i].poly for i in group.rooms])
+    return safe_op(lambda a, b: a.difference(b), zone, plan.walls_win.buffer(HUB_CLEARANCE_M))
 
 
 def _longest_clear_stretch(ring: np.ndarray, region, avoid: np.ndarray):
@@ -101,7 +129,13 @@ def _reanchor(ring: np.ndarray, hub: np.ndarray, seg: int) -> np.ndarray:
     return np.vstack([pts[k:], pts[:k], pts[k:k + 1]])
 
 
-def place_hub(plan: Plan, grid: Grid, group: Group) -> Ring | None:
+def _stops_once(ring: np.ndarray, nodes: np.ndarray) -> bool:
+    """Every own node is a stop of the ring exactly once."""
+    return all(int((np.abs(ring[:-1] - xy).max(axis=1) <= TOL).sum()) == 1 for xy in nodes)
+
+
+def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CANDIDATES,
+              block_nodes: bool = False) -> Ring | None:
     region = hub_region(plan, group)
     nodes = grid.pts[grid.node_pt[list(group.rooms)]]
     best: Ring | None = None
@@ -114,6 +148,8 @@ def place_hub(plan: Plan, grid: Grid, group: Group) -> Ring | None:
         if hit is not None:
             hub, seg = hit
             ring = _reanchor(lp.ring, hub, seg)
+            if not _stops_once(ring, nodes):
+                continue
             m = measure([ring], exempt_points=np.vstack([nodes, hub]))
             cand = Ring(group, lp.order, tuple(hub), ring, m, "on-loop")
             if best is None or cand.J < best.J:
@@ -127,24 +163,54 @@ def place_hub(plan: Plan, grid: Grid, group: Group) -> Ring | None:
                         & np.isin(grid.room_of, group.rooms))
     ok = ok[~np.isin(ok, grid.node_pt[list(group.rooms)])]
     if len(ok) == 0:
-        return None
+        return _micro_hub(plan, grid, group) if group.n_devices == 1 else None
     ref = group.loops[0].ring if group.loops else nodes
     d = np.abs(grid.pts[ok][:, None, :] - ref[None, :, :]).sum(axis=2).min(axis=1)
-    allowed = np.isin(grid.room_of, group.rooms) | (grid.room_of < 0)
+    allowed = zone_allowed(grid, group.rooms)
     orders = [lp.order for lp in group.loops] or [group.rooms]
-    for h in ok[np.argsort(d)[:N_HUB_CANDIDATES]]:
-        router = RingRouter(grid, allowed, np.r_[grid.node_pt[list(group.rooms)], h])
+    for h in ok[np.argsort(d)[:n_candidates]]:
+        router = RingRouter(grid, allowed, np.r_[grid.node_pt[list(group.rooms)], h], block_nodes)
         for order in orders[:2]:
             paths = router.ring([int(h)] + [int(grid.node_pt[r]) for r in order])
             if paths is None:
                 continue
             legs = [states_to_polyline(grid, p) for p in paths]
             ring = np.vstack([legs[0]] + [lg[1:] for lg in legs[1:]])
+            if not _stops_once(ring, nodes):
+                continue
             m = measure([ring], exempt_points=np.vstack([nodes, grid.pts[h]]))
             cand = Ring(group, tuple(order), tuple(grid.pts[h]), ring, m, "rerouted")
             if best is None or cand.J < best.J:
                 best = cand
     return best
+
+
+MICRO_STEPS_M = (0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005)
+
+
+def _micro_hub(plan: Plan, grid: Grid, group: Group) -> Ring | None:
+    """Last resort for a one-room zone with no spot 0.5 m from the walls
+    (narrow closet, sliver): hub a short step from the node along an axis,
+    ring hub → node → hub. Picks the step with the most wall clearance; the
+    ring is flagged through hub_clearance < 0.5 m."""
+    room = group.rooms[0]
+    n = grid.pts[grid.node_pt[room]]
+    poly = plan.rooms[room].poly
+    best = None
+    for d in MICRO_STEPS_M:
+        for v in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+            h = n + d * np.asarray(v, float)
+            if not (poly.covers(Point(h)) and shapely.covered_by(LineString([n, h]), plan.free.buffer(1e-6))):
+                continue
+            c = plan.walls_win.distance(Point(h))
+            if best is None or c > best[0] + 1e-9:
+                best = (c, h)
+    if best is None:
+        return None
+    c, h = best
+    ring = np.array([h, n, h])
+    m = measure([ring], exempt_points=np.vstack([n, h]))
+    return Ring(group, (room,), tuple(h), ring, m, "micro", min(HUB_CLEARANCE_M, float(c)))
 
 
 def choose_groups(groups: list[Group], rings: dict[int, Ring], n: int) -> list[Ring] | None:
@@ -188,76 +254,155 @@ def _better(cand, cur, rings) -> bool:
     return spread(cand[2]) < spread(cur[2])
 
 
-def validate(plan: Plan, grid: Grid, rings: list[Ring], adj) -> dict:
-    """Hard rules from slides 2–3, checked from the output geometry."""
-    n = len(plan.rooms)
-    covered = sorted(r for rg in rings for r in rg.order)
-    node_xy = grid.pts[grid.node_pt]
-    walls_win = unary_union([plan.walls, plan.windows])
-    free = plan.free.buffer(1e-6)
-    shapely.prepare(free)
-    checks = {
-        "every room in exactly one ring": covered == list(range(n)),
-        "≤ 100 m² per hub": all(rg.group.area <= 100 + 1e-6 for rg in rings),
-        "≤ 5 devices per hub": all(len(rg.order) <= 5 for rg in rings),
-        "zones connected through doors/openings": all(
-            nx.is_connected(adj.subgraph(rg.group.rooms)) for rg in rings),
-    }
-    closed = axis = through_walls = visits = hub_clear = node_clear = hub_in_zone = True
-    for rg in rings:
-        r = rg.ring
-        closed &= bool(np.abs(r[0] - np.asarray(rg.hub)).max() <= TOL and np.abs(r[-1] - r[0]).max() <= TOL)
+RING_RULES = ("≤ 100 m² per hub", "≤ 5 devices per hub", "zones connected through doors/openings",
+              "each ring closed at its own hub", "axis-aligned cable",
+              "no wall/window crossed, inside boundary", "each node visited once, no foreign nodes",
+              "hub ≥ 0.5 m from walls (or best possible, flagged)", "hub inside its zone")
+NODE_RULE = "nodes ≥ 0.5 m from walls (or best possible, flagged)"
+
+
+class Checker:
+    """Hard rules from slides 2–3, checked from the output geometry. Ring
+    rules are checked per ring so the fallback can drop just the bad rings."""
+
+    def __init__(self, plan: Plan, grid: Grid, adj):
+        self.plan, self.grid, self.adj = plan, grid, adj
+        self.node_xy = grid.pts[grid.node_pt]
+        self.walls_win = plan.walls_win
+        self.free = plan.free.buffer(1e-6)
+        shapely.prepare(self.free)
+
+    def ring(self, rg: Ring) -> dict:
+        plan, r, g = self.plan, rg.ring, rg.group
+        closed = bool(np.abs(r[0] - np.asarray(rg.hub)).max() <= TOL and np.abs(r[-1] - r[0]).max() <= TOL)
         seg = np.diff(r, axis=0)
-        axis &= bool(np.all((np.abs(seg[:, 0]) <= TOL) | (np.abs(seg[:, 1]) <= TOL)))
-        through_walls &= bool(shapely.covered_by(LineString(r), free))
-        # each own node visited exactly once as a stop; no other node on the cable
         line = LineString(r)
-        for i in range(n):
-            on = line.distance(Point(node_xy[i])) <= TOL
-            stops = int((np.abs(r[:-1] - node_xy[i]).max(axis=1) <= TOL).sum())
+        visits = True
+        for i in range(len(plan.rooms)):            # own nodes once as a stop; no other node on the cable
             if i in rg.order:
-                visits &= stops == 1
+                visits &= int((np.abs(r[:-1] - self.node_xy[i]).max(axis=1) <= TOL).sum()) == 1
             else:
-                visits &= not on
+                visits &= not line.distance(Point(self.node_xy[i])) <= TOL
         hp = Point(rg.hub)
-        hub_clear &= walls_win.distance(hp) >= HUB_CLEARANCE_M - TOL
-        hub_in_zone &= bool(unary_union([plan.rooms[i].poly for i in rg.order]).buffer(TOL).covers(hp))
-    for i in range(n):
-        node_clear &= walls_win.distance(Point(node_xy[i])) >= NODE_CLEARANCE_M - TOL
-    checks.update({
-        "each ring closed at its own hub": closed,
-        "axis-aligned cable": axis,
-        "no wall/window crossed, inside boundary": through_walls,
-        "each node visited once, no foreign nodes": visits,
-        "hub ≥ 0.5 m from walls": hub_clear,
-        "hub inside its zone": hub_in_zone,
-        "nodes ≥ 0.5 m from walls (input)": node_clear,
-    })
-    return checks
+        return dict(zip(RING_RULES, (
+            g.area <= MAX_AREA_M2 + AREA_TOL_M2,
+            len(rg.order) <= 5,
+            nx.is_connected(self.adj.subgraph(g.rooms)),
+            closed,
+            bool(np.all((np.abs(seg[:, 0]) <= TOL) | (np.abs(seg[:, 1]) <= TOL))),
+            bool(shapely.covered_by(line, self.free)),
+            bool(visits),
+            self.walls_win.distance(hp) >= min(HUB_CLEARANCE_M, rg.hub_clearance) - TOL,
+            bool(_union([plan.rooms[i].poly for i in rg.order]).buffer(TOL).covers(hp)),
+        )))
+
+    def ring_ok(self, rg: Ring) -> bool:
+        return all(self.ring(rg).values())
+
+    def __call__(self, rings: list[Ring]) -> dict:
+        n = len(self.plan.rooms)
+        per = [self.ring(rg) for rg in rings]
+        checks = {"every room in exactly one ring": sorted(r for rg in rings for r in rg.order) == list(range(n))}
+        checks.update({k: all(p[k] for p in per) for k in RING_RULES})
+        checks[NODE_RULE] = all(
+            self.walls_win.distance(Point(self.node_xy[i])) >= min(NODE_CLEARANCE_M, r.clearance) - TOL
+            for i, r in enumerate(self.plan.rooms))
+        return checks
 
 
-def solve_plan(raw: dict) -> Solution | None:
-    t = time.perf_counter()
-    plan = build_plan(raw)
-    grid = build_grid(plan)
-    adj = room_adjacency(plan, grid)
-    groups = enumerate_groups(plan, adj)
-    solve_all(groups, grid, restrict=True)
-    rings = {}
-    for g in groups:
-        rg = place_hub(plan, grid, g)
-        if rg is not None:
-            rings[g.mask] = rg
-    chosen = choose_groups(groups, rings, len(plan.rooms))
+def validate(plan: Plan, grid: Grid, rings: list[Ring], adj) -> dict:
+    return Checker(plan, grid, adj)(rings)
+
+
+def _finish(plan, grid, chosen, checker, t0) -> Solution:
     if chosen is None:
         return Solution(plan, [], Metrics(0, 0, 0, 0), {"feasible grouping exists": False},
-                        time.perf_counter() - t)
+                        time.perf_counter() - t0, status="partial")
     exempt = np.vstack([grid.pts[grid.node_pt], np.array([rg.hub for rg in chosen])])
     total = measure([rg.ring for rg in chosen], exempt_points=exempt)
-    sol = Solution(plan, chosen, total, validate(plan, grid, chosen, adj), time.perf_counter() - t)
+    sol = Solution(plan, chosen, total, checker(chosen), time.perf_counter() - t0)
+    sol.status = "valid" if sol.valid else "partial"
+    return sol
+
+
+def _attempt(plan: Plan, cfg: Config, t0: float, log: list[str]) -> tuple[Solution, int]:
+    """One rung pair of the ladder: (solution, 0 = DP over all rings,
+    1 = DP over rings passing every per-ring rule)."""
+    grid = build_grid(plan, cfg.fill)
+    adj = room_adjacency(plan, grid)
+    groups = enumerate_groups(plan, adj)
+    solve_all(groups, grid, restrict=True, keep=cfg.keep, block_nodes=cfg.block_nodes)
+    rings = {}
+    for g in groups:
+        try:
+            rg = place_hub(plan, grid, g, cfg.hub_candidates, cfg.block_nodes)
+        except Exception as e:          # one bad zone must not sink the plan
+            log.append(f"hub placement failed for {g.room_ids}: {type(e).__name__}: {e}")
+            continue
+        if rg is not None:
+            rings[g.mask] = rg
+    checker = Checker(plan, grid, adj)
+    n = len(plan.rooms)
+    # micro hubs break the 0.5 m hub rule (flagged), so only when nothing else covers the plan
+    strict = {m: rg for m, rg in rings.items() if rg.hub_method != "micro"}
+    chosen = choose_groups(groups, strict, n)
+    if chosen is None and len(strict) < len(rings):
+        chosen = choose_groups(groups, rings, n)
+    sol = _finish(plan, grid, chosen, checker, t0)
+    sub = 0
+    if not sol.valid:
+        log.append("failed: " + ", ".join(k for k, v in sol.checks.items() if v is not True))
+        good = {m: rg for m, rg in rings.items() if checker.ring_ok(rg)}
+        alt = _finish(plan, grid, choose_groups(groups, good, n), checker, t0)
+        if alt.valid or not sol.rings:
+            sol, sub = alt, 1
     sol.grid = grid
     sol.lower_bound = hub_lower_bound(plan)
-    return sol
+    return sol, sub
+
+
+def solve_plan(raw: dict, time_limit: float = TIME_LIMIT_S) -> Solution:
+    """Solve one plan, walking down the fallback ladder until a result passes
+    every hard rule. Never raises for a plan that builds; check .status."""
+    t0 = time.perf_counter()
+    plan = build_plan(raw)
+    big = [r.id for r in plan.rooms if r.area > MAX_AREA_M2 + AREA_TOL_M2]
+    # ResPlan sometimes labels a sliver of wall as a room: no free space inside, no cable can reach it
+    walled = [r.id for r in plan.rooms
+              if safe_op(lambda a, b: a.intersection(b), r.poly, plan.free).area < 1e-6]
+    if big or walled:
+        sol = Solution(plan, [], Metrics(0, 0, 0, 0), {"feasible grouping exists": False},
+                       time.perf_counter() - t0, status="infeasible",
+                       log=[f"{i}: room > 100 m²" for i in big] + [f"{i}: room lies inside a wall" for i in walled])
+        sol.lower_bound = hub_lower_bound(plan)
+        return sol
+    log: list[str] = []
+    best = None
+    for base, cfg in ((0, NORMAL), (2, SAFER)):
+        if base and time.perf_counter() - t0 > time_limit / 3:
+            log.append("no time left for the safer retry")
+            break
+        try:
+            sol, sub = _attempt(plan, cfg, t0, log)
+        except Exception as e:
+            log.append(f"{FALLBACK_LEVELS[base]} attempt crashed: {type(e).__name__}: {e}")
+            continue
+        sol.fallback = base + sub
+        if sol.valid:
+            best = sol
+            break
+        if best is None or (sol.rings and not best.rings):
+            best = sol
+    if best is None:
+        best = Solution(plan, [], Metrics(0, 0, 0, 0), {"feasible grouping exists": False})
+        best.lower_bound = hub_lower_bound(plan)
+    if not best.valid:
+        best.fallback, best.status = len(FALLBACK_LEVELS) - 1, "partial"
+    best.log = log + plan.flags + [
+        f"{rg.group.room_ids[0]}: hub clearance only {rg.hub_clearance:.2f} m (micro hub, room too narrow)"
+        for rg in best.rings if rg.hub_clearance < HUB_CLEARANCE_M]
+    best.seconds = time.perf_counter() - t0
+    return best
 
 
 def to_json(sol: Solution) -> dict:
@@ -282,6 +427,9 @@ def to_json(sol: Solution) -> dict:
         "J": sol.total.J,
         "totals": {"L": sol.total.L, "B": sol.total.B, "X": sol.total.X, "O": sol.total.O},
         "checks": sol.checks,
+        "status": sol.status,
+        "fallback": FALLBACK_LEVELS[sol.fallback],
+        "log": sol.log,
     }
 
 
