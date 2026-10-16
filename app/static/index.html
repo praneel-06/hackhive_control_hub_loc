@@ -524,7 +524,7 @@ function drawPlan(target, d, opts = {}) {
   const devRing = {};
   d.hubs.forEach(h => h.room_idx.forEach((ri, j) => devRing[ri] = [h.k, j + 1]));
   const devs = L("devices");
-  for (const r of d.rooms) {
+  for (const r of (d.unsolved ? [] : d.rooms)) {
     const z = devRing[r.i];
     const c = z ? zc(z[0]) : "#d62728";
     const grp = el("g", { class: opts.drag ? "dev" : "", "data-room": r.i }, devs);
@@ -735,11 +735,12 @@ $("top3").addEventListener("click", e => { if (e.target.id === "top3") $("top3")
 
 // ---------- phases
 async function openPhases() {
-  if (!cur) return;
+  const target = cur || sel;
+  if (!target) return;
   $("phases").hidden = false; $("phTitle").textContent = "Drawing the phases…";
   $("phImg").removeAttribute("src"); $("phCount").textContent = "";
   try {
-    const r = await api(`/api/phases/${cur.id}`);
+    const r = await api(`/api/phases/${target.id}`);
     phaseList = r.images; phaseIdx = 0;
     $("phRange").max = Math.max(0, phaseList.length - 1);
     showPhase(0);
@@ -750,7 +751,7 @@ function showPhase(i) {
   phaseIdx = Math.max(0, Math.min(phaseList.length - 1, i));
   const p = phaseList[phaseIdx];
   $("phImg").src = p.url; $("phImg").alt = p.title;
-  $("phTitle").textContent = `Plan ${cur.id} · Phase ${p.title}`;
+  $("phTitle").textContent = `Plan ${(cur || sel).id} · Phase ${p.title}`;
   $("phRange").value = phaseIdx; $("phCount").textContent = `${phaseIdx + 1} / ${phaseList.length}`;
 }
 $("phasebtn").onclick = openPhases;
@@ -766,7 +767,7 @@ addEventListener("keydown", e => {
     if (e.key === "ArrowLeft") showPhase(phaseIdx - 1);
     return;
   }
-  if (e.key === "Enter" && document.activeElement === $("pid")) solve();
+  if (e.key === "Enter" && document.activeElement === $("pid")) { clearTimeout(typeTimer); selectPlan($("pid").value); }
 });
 
 // ---------- batch
@@ -929,16 +930,43 @@ function setView_(v) {
 $("tabPlan").onclick = () => setView_("plan");
 $("tabBatch").onclick = () => setView_("batch");
 // Picking a plan only fills in the ID; the solver runs when Solve is pressed.
-function selectPlan(pid) {
+let selSeq = 0, sel = null;
+function resetPanel() {
+  for (const id of ["sH", "sJ", "sL", "sB", "sX", "sO"]) $(id).textContent = "–";
+  $("sHsub").textContent = "hubs"; $("scorehead").textContent = "Score";
+  $("valid").className = "valid"; $("vsum").textContent = "Not solved yet"; $("vlist").innerHTML = "";
+  $("hubs").innerHTML = `<div class="sub">Press Solve to place hubs and cables.</div>`;
+  $("logbox").hidden = true; $("moved").hidden = true;
+  $("top3btn").disabled = true; $("export").disabled = true;
+  $("timing").textContent = "not solved yet"; $("timing").className = "badge";
+}
+// Picking a plan shows the bare floor plan; the solver runs when Solve is pressed.
+async function selectPlan(pid) {
+  pid = Number(pid);
+  if (!Number.isFinite(pid)) return;
   $("pid").value = pid;
-  if (!cur || cur.id !== Number(pid)) {
-    $("ptitle").textContent = `Plan ${pid}`;
-    $("pmsg").textContent = "Press Solve to run the solver"; $("pmsg").className = "msg";
-    $("moved").hidden = true;
+  const seq = ++selSeq;
+  moved = {}; base = null; cur = null; shownOption = null;
+  $("phases").hidden = true; $("top3").hidden = true;
+  resetPanel();
+  $("ptitle").textContent = `Plan ${pid}`; $("pmsg").textContent = "Loading the floor plan…"; $("pmsg").className = "msg";
+  try {
+    const d = await api(`/api/plan/${pid}`);
+    if (seq !== selSeq) return;                       // a newer selection won
+    sel = d; draw(d); $("phasebtn").disabled = false;
+    $("pmsg").textContent = `Floor plan as given · ${d.rooms.length} rooms need a device (${d.eligible_area.toFixed(1)} m²) · ${d.excluded.length} excluded · press Solve`;
+  } catch (e) {
+    if (seq !== selSeq) return;
+    sel = null; svg.innerHTML = ""; $("empty").hidden = false; $("phasebtn").disabled = true;
+    $("pmsg").textContent = e.message; $("pmsg").className = "msg bad";
   }
 }
 $("solve").onclick = () => solve();
-$("pid").addEventListener("input", () => { if ($("pid").value) selectPlan($("pid").value); });
+let typeTimer = null;
+$("pid").addEventListener("input", () => {
+  clearTimeout(typeTimer);
+  if ($("pid").value) typeTimer = setTimeout(() => selectPlan($("pid").value), 350);
+});
 $("rand").onclick = async () => selectPlan((await api("/api/random")).id);
 function step(dir) {
   if (!ids.length) return;
@@ -977,7 +1005,10 @@ try {
   const last = localStorage.getItem("crp-last"); if (last) $("pid").value = last;
   if (localStorage.getItem("crp-view") === "batch") setView_("batch");
 } catch (e) {}
-refreshDataset().then(() => selectPlan($("pid").value));
+refreshDataset().then(() => {
+  const v = Number($("pid").value);                 // a remembered photo plan is gone after a restart
+  selectPlan(ids.includes(v) ? v : (ids.includes(10324) ? 10324 : ids[0]));
+});
 </script>
 </body>
 </html>

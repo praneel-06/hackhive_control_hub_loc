@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 warnings.filterwarnings("ignore")
 
 from hubring.groups import room_adjacency                      # noqa: E402
-from hubring.plan import RESPLAN_DIR, DeviceError, load_plans   # noqa: E402
+from hubring.plan import RESPLAN_DIR, DeviceError, build_plan, load_plans   # noqa: E402
 from hubring.solve import FALLBACK_LEVELS, solve_plan, to_json, top_solutions  # noqa: E402
 
 PHASE_DIR = ROOT / "out" / "ui_phases"
@@ -181,6 +181,30 @@ def plans():
 @app.get("/api/random")
 def random_plan():
     return {"id": random.choice(list(PLANS))}
+
+
+@app.get("/api/plan/{pid}")
+def plan_only(pid: int):
+    """The floor plan as given (no solve): rooms, excluded rooms, walls, doors, windows."""
+    try:
+        plan = build_plan(_raw(pid))
+    except DeviceError as e:
+        raise HTTPException(400, str(e))
+    names = _names(plan.rooms)
+    x0, y0, x1, y1 = plan.inner.bounds
+    for r in plan.rooms:
+        bx0, by0, bx1, by1 = r.poly.bounds
+        x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
+    return {
+        "id": plan.id, "bounds": [x0, y0, x1, y1], "unsolved": True,
+        "rooms": [{"i": i, "id": r.id, "type": r.type, "name": names[i], "area": r.area, "path": _path(r.poly),
+                   "zone": None, "node": [float(v) for v in r.node], "clearance": r.clearance}
+                  for i, r in enumerate(plan.rooms)],
+        "excluded": [{"id": n, "type": n.rsplit("_", 1)[0], "path": _path(g)} for n, g in plan.excluded],
+        "walls": _path(plan.walls), "windows": _path(plan.windows), "doors": "".join(_path(d) for d in plan.doors),
+        "hubs": [], "grid": None, "graph": [], "log": [],
+        "eligible_area": sum(r.area for r in plan.rooms),
+    }
 
 
 @app.get("/api/solve/{pid}")
