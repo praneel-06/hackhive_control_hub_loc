@@ -13,7 +13,7 @@ import numpy as np
 import shapely
 from shapely.geometry import MultiPolygon, Polygon
 
-from .plan import Plan
+from .plan import MIN_HUB_NODE_M, Plan
 
 WALL_OFFSET_M = 0.15   # run cable this far inside a room's wall
 FILL_SPACING_M = 1.0   # max gap between grid lines in open areas
@@ -21,7 +21,7 @@ MERGE_M = 0.05         # lines closer than this merge into one
 DOOR_LANE_M = 0.15     # side lanes either side of a door centre line
 
 # Line priorities: when two lines merge, the higher one keeps its position.
-PRI_NODE, PRI_DOOR, PRI_WALL, PRI_FILL = 3, 2, 1, 0
+PRI_NODE, PRI_DOOR, PRI_HUB, PRI_WALL, PRI_FILL = 3, 2, 1.5, 1, 0
 
 
 @dataclass
@@ -86,6 +86,11 @@ def build_grid(plan: Plan, fill: float = FILL_SPACING_M) -> Grid:
     for r in plan.rooms:
         xl.append((r.node[0], PRI_NODE))
         yl.append((r.node[1], PRI_NODE))
+        # lines MIN_HUB_NODE_M either side of the node: the closest legal hub spot
+        # for a one-device zone (hub → node → hub out and back)
+        for sgn in (-1, 1):
+            xl.append((r.node[0] + sgn * MIN_HUB_NODE_M, PRI_HUB))
+            yl.append((r.node[1] + sgn * MIN_HUB_NODE_M, PRI_HUB))
         wx, wy = _room_wall_lines(r.poly)
         xl += [(x, PRI_WALL) for x in wx]
         yl += [(y, PRI_WALL) for y in wy]

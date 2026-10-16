@@ -28,6 +28,9 @@ EXCLUDED = ("bathroom", "balcony", "stair", "garden", "pool", "parking", "land")
 # 'fallback' is synthetic and 'via_window' is not a passage.
 PASSAGE_EDGES = ("via_door", "via_opening")
 NODE_CLEARANCE_M = 0.5
+# Minimum hub-to-device distance (assumed by the team, 2026-10-16, pending the
+# organisers): no hub closer than this to any device node.
+MIN_HUB_NODE_M = 0.1
 # Fallback clearances tried, in order, when a room has no point 0.5 m from
 # every wall and window (narrow closets, slivers). The node goes where the
 # largest of these still fits, and the plan is flagged.

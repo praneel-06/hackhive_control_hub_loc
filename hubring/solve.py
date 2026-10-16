@@ -42,10 +42,11 @@ from .groups import (AREA_TOL_M2, MAX_AREA_M2, Group, enumerate_groups, hub_lowe
                      min_cover_groups, room_adjacency)
 from .loops import KEEP_TOP, RingRouter, solve_all, zone_allowed
 from .metrics import TOL, Metrics, measure
-from .plan import NODE_CLEARANCE_M, Plan, _union, build_plan, safe_op
+from .plan import MIN_HUB_NODE_M, NODE_CLEARANCE_M, Plan, _union, build_plan, safe_op
 from .routing import states_to_polyline
 
 HUB_CLEARANCE_M = 0.5
+HUB_SLACK_M = 1e-5      # grid coordinates are rounded to 1 µm; far inside the 1 mm tolerance
 N_HUB_CANDIDATES = 6
 TIME_LIMIT_S = 30.0     # soft budget per plan: no safer retry once a third of it is used
 
@@ -98,10 +99,16 @@ class Solution:
         return bool(self.checks) and all(v is True for v in self.checks.values())
 
 
-def hub_region(plan: Plan, group: Group):
-    """Where this group's hub may sit: its rooms, ≥ 0.5 m from walls/windows."""
+def hub_region(plan: Plan, group: Group, devices: np.ndarray | None = None):
+    """Where this group's hub may sit: its rooms, ≥ 0.5 m from walls/windows
+    and ≥ MIN_HUB_NODE_M from every device point."""
     zone = _union([plan.rooms[i].poly for i in group.rooms])
-    return safe_op(lambda a, b: a.difference(b), zone, plan.walls_win.buffer(HUB_CLEARANCE_M))
+    blocked = plan.walls_win.buffer(HUB_CLEARANCE_M)
+    if devices is not None and len(devices):
+        # vertices of the buffered circle sit on the axes at exactly MIN_HUB_NODE_M,
+        # so a hub straight out from a device at that distance stays legal
+        blocked = _union([blocked, shapely.multipoints(devices).buffer(MIN_HUB_NODE_M - HUB_SLACK_M)])
+    return safe_op(lambda a, b: a.difference(b), zone, blocked)
 
 
 def _longest_clear_stretch(ring: np.ndarray, region, avoid: np.ndarray):
@@ -137,7 +144,7 @@ def _stops_once(ring: np.ndarray, nodes: np.ndarray) -> bool:
 
 def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CANDIDATES,
               block_nodes: bool = False) -> Ring | None:
-    region = hub_region(plan, group)
+    region = hub_region(plan, group, grid.pts[grid.node_pt])
     nodes = grid.pts[grid.node_pt[list(group.rooms)]]
     best: Ring | None = None
 
@@ -162,8 +169,8 @@ def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CA
     shapely.prepare(region)
     ok = np.flatnonzero(shapely.covered_by(shapely.points(grid.pts), region)
                         & np.isin(grid.room_of, group.rooms))
-    near_node = np.abs(grid.pts[ok][:, None, :] - grid.pts[grid.node_pt][None, :, :]).sum(axis=2).min(axis=1)
-    ok = ok[near_node >= MIN_HUB_NODE_M]
+    near_node = np.linalg.norm(grid.pts[ok][:, None, :] - grid.pts[grid.node_pt][None, :, :], axis=2).min(axis=1)
+    ok = ok[near_node >= MIN_HUB_NODE_M - HUB_SLACK_M]
     if len(ok) == 0:
         return _micro_hub(plan, grid, group) if group.n_devices == 1 else None
 
@@ -203,7 +210,6 @@ def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CA
 
 
 DIRECT_MAX_STEPS = 12     # grid steps walked out from the node per heading
-MIN_HUB_NODE_M = 2 * TOL  # a hub closer than this to a device would merge with it at 1 mm tolerance
 
 
 def _neighbours(grid: Grid) -> np.ndarray:
@@ -233,7 +239,7 @@ def _direct_hub(plan: Plan, grid: Grid, group: Group, region) -> Ring | None:
             p = int(nb[p, h])
             if p < 0 or not allowed[p]:
                 break
-            if (grid.room_of[p] == room and np.abs(grid.pts[p] - n).sum() >= MIN_HUB_NODE_M
+            if (grid.room_of[p] == room and np.abs(grid.pts[p] - n).sum() >= MIN_HUB_NODE_M - HUB_SLACK_M
                     and region.covers(Point(grid.pts[p]))):
                 ring = np.array([grid.pts[p], n, grid.pts[p]])
                 m = measure([ring], exempt_points=np.vstack([n, grid.pts[p]]))
@@ -244,7 +250,7 @@ def _direct_hub(plan: Plan, grid: Grid, group: Group, region) -> Ring | None:
     return best
 
 
-MICRO_STEPS_M = (0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005)
+MICRO_STEPS_M = (0.5, 0.3, 0.2, 0.15, MIN_HUB_NODE_M)
 
 
 def _micro_hub(plan: Plan, grid: Grid, group: Group) -> Ring | None:
@@ -260,6 +266,8 @@ def _micro_hub(plan: Plan, grid: Grid, group: Group) -> Ring | None:
         for v in ((1, 0), (0, 1), (-1, 0), (0, -1)):
             h = n + d * np.asarray(v, float)
             if not (poly.covers(Point(h)) and shapely.covered_by(LineString([n, h]), plan.free.buffer(1e-6))):
+                continue
+            if np.linalg.norm(grid.pts[grid.node_pt] - h, axis=1).min() < MIN_HUB_NODE_M - HUB_SLACK_M:
                 continue
             c = plan.walls_win.distance(Point(h))
             if best is None or c > best[0] + 1e-9:
@@ -316,7 +324,8 @@ def _better(cand, cur, rings) -> bool:
 RING_RULES = ("≤ 100 m² per hub", "≤ 5 devices per hub", "zones connected through doors/openings",
               "each ring closed at its own hub", "axis-aligned cable",
               "no wall/window crossed, inside boundary", "each node visited once, no foreign nodes",
-              "hub ≥ 0.5 m from walls (or best possible, flagged)", "hub inside its zone")
+              "hub ≥ 0.5 m from walls (or best possible, flagged)", "hub inside its zone",
+              "hub ≥ 0.1 m from every device")
 NODE_RULE = "nodes ≥ 0.5 m from walls (or best possible, flagged)"
 
 
@@ -353,6 +362,7 @@ class Checker:
             bool(visits),
             self.walls_win.distance(hp) >= min(HUB_CLEARANCE_M, rg.hub_clearance) - TOL,
             bool(_union([plan.rooms[i].poly for i in rg.order]).buffer(TOL).covers(hp)),
+            float(np.linalg.norm(self.node_xy - np.asarray(rg.hub), axis=1).min()) >= MIN_HUB_NODE_M - TOL,
         )))
 
     def ring_ok(self, rg: Ring) -> bool:
