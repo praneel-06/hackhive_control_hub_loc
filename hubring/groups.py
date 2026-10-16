@@ -184,3 +184,33 @@ def min_hubs(groups: list[Group], n: int) -> tuple[int | None, int]:
 
     h, c = solve(full)
     return (None, 0) if h >= INF else (h, c)
+
+
+def min_cover_groups(groups: list[Group], n: int) -> tuple[int | None, list[Group]]:
+    """Fewest hubs H* and the groups that appear in at least one H*-hub
+    exact cover. Only those can be in the final answer (fewest hubs is scored
+    first), so only they need rings. g qualifies iff the rest of the plan can
+    be covered exactly by H* − 1 groups. (None, all groups) if no cover exists.
+    """
+    full = (1 << n) - 1
+    by_low: dict[int, list[int]] = {}
+    for g in groups:
+        by_low.setdefault(g.lowest, []).append(g.mask)
+    INF = 10 ** 9
+    memo = {0: 0}
+
+    def f(rem: int) -> int:                      # fewest groups covering rem exactly
+        if rem in memo:
+            return memo[rem]
+        low = (rem & -rem).bit_length() - 1
+        out = INF
+        for m in by_low.get(low, ()):
+            if m & rem == m:
+                out = min(out, f(rem ^ m) + 1)
+        memo[rem] = out
+        return out
+
+    h = f(full)
+    if h >= INF:
+        return None, list(groups)
+    return h, [g for g in groups if f(full ^ g.mask) == h - 1]

@@ -38,7 +38,8 @@ import shapely
 from shapely.geometry import LineString, Point
 
 from .grid import FILL_SPACING_M, Grid, build_grid
-from .groups import AREA_TOL_M2, MAX_AREA_M2, Group, enumerate_groups, hub_lower_bound, room_adjacency
+from .groups import (AREA_TOL_M2, MAX_AREA_M2, Group, enumerate_groups, hub_lower_bound,
+                     min_cover_groups, room_adjacency)
 from .loops import KEEP_TOP, RingRouter, solve_all, zone_allowed
 from .metrics import TOL, Metrics, measure
 from .plan import NODE_CLEARANCE_M, Plan, _union, build_plan, safe_op
@@ -69,7 +70,7 @@ class Ring:
     hub: tuple[float, float]     # metres
     ring: np.ndarray             # closed polyline from hub back to hub, metres
     metrics: Metrics
-    hub_method: str              # "on-loop" (free), "rerouted" or "micro" (narrow room, flagged)
+    hub_method: str              # "on-loop" (free), "direct" (1 device), "rerouted" or "micro" (flagged)
     hub_clearance: float = HUB_CLEARANCE_M   # clearance the hub was placed with (< 0.5 m ⇒ flagged)
 
     @property
@@ -157,13 +158,29 @@ def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CA
     if best is not None:
         return best
 
-    # (2) re-route through candidate hub grid points (1-device groups, or loops hugging walls)
+    # legal hub grid points: in the zone, ≥ 0.5 m from walls, not on a device
     shapely.prepare(region)
     ok = np.flatnonzero(shapely.covered_by(shapely.points(grid.pts), region)
                         & np.isin(grid.room_of, group.rooms))
-    ok = ok[~np.isin(ok, grid.node_pt[list(group.rooms)])]
+    near_node = np.abs(grid.pts[ok][:, None, :] - grid.pts[grid.node_pt][None, :, :]).sum(axis=2).min(axis=1)
+    ok = ok[near_node >= MIN_HUB_NODE_M]
     if len(ok) == 0:
         return _micro_hub(plan, grid, group) if group.n_devices == 1 else None
+
+    # (2) one device: hub on a grid point straight out from the node, ring
+    #     hub → node → hub, J = 3d + 1 (L 2d, O d, 2 reversals). Any other ring
+    #     through a hub at L1 distance ≥ d_min costs ≥ 3·d_min + 1 if it has 2
+    #     bends (straight out-and-back) or ≥ 2·d_min + 2 with 4+ bends. When the
+    #     direct ring meets that bound it is optimal and the Dijkstra re-route
+    #     below is skipped; otherwise both are tried and the cheaper wins.
+    if group.n_devices == 1:
+        best = _direct_hub(plan, grid, group, region)
+        d_min = float(np.abs(grid.pts[ok] - nodes[0]).sum(axis=1).min())
+        if best is not None and best.J <= min(3 * d_min + 1, 2 * d_min + 2) + 1e-9:
+            return best
+
+    # (3) re-route through candidate hub grid points (1 device with no provably
+    #     best direct spot, or loops hugging walls)
     ref = group.loops[0].ring if group.loops else nodes
     d = np.abs(grid.pts[ok][:, None, :] - ref[None, :, :]).sum(axis=2).min(axis=1)
     allowed = zone_allowed(grid, group.rooms)
@@ -182,6 +199,48 @@ def place_hub(plan: Plan, grid: Grid, group: Group, n_candidates: int = N_HUB_CA
             cand = Ring(group, tuple(order), tuple(grid.pts[h]), ring, m, "rerouted")
             if best is None or cand.J < best.J:
                 best = cand
+    return best
+
+
+DIRECT_MAX_STEPS = 12     # grid steps walked out from the node per heading
+MIN_HUB_NODE_M = 2 * TOL  # a hub closer than this to a device would merge with it at 1 mm tolerance
+
+
+def _neighbours(grid: Grid) -> np.ndarray:
+    """nb[p, h]: neighbour of grid point p in heading h (E N W S), -1 if none. Cached."""
+    nb = getattr(grid, "_nb", None)
+    if nb is None:
+        nb = -np.ones((len(grid.pts), 4), np.int64)
+        a, b = grid.edges[:, 0], grid.edges[:, 1]
+        d = grid.pts[b] - grid.pts[a]
+        fwd = np.where(grid.horizontal, np.where(d[:, 0] > 0, 0, 2), np.where(d[:, 1] > 0, 1, 3))
+        nb[a, fwd] = b
+        nb[b, (fwd + 2) % 4] = a
+        grid._nb = nb
+    return nb
+
+
+def _direct_hub(plan: Plan, grid: Grid, group: Group, region) -> Ring | None:
+    room = group.rooms[0]
+    node = int(grid.node_pt[room])
+    n = grid.pts[node]
+    allowed = zone_allowed(grid, group.rooms)
+    nb = _neighbours(grid)
+    best = None
+    for h in range(4):
+        p = node
+        for _ in range(DIRECT_MAX_STEPS):
+            p = int(nb[p, h])
+            if p < 0 or not allowed[p]:
+                break
+            if (grid.room_of[p] == room and np.abs(grid.pts[p] - n).sum() >= MIN_HUB_NODE_M
+                    and region.covers(Point(grid.pts[p]))):
+                ring = np.array([grid.pts[p], n, grid.pts[p]])
+                m = measure([ring], exempt_points=np.vstack([n, grid.pts[p]]))
+                cand = Ring(group, (room,), tuple(grid.pts[p]), ring, m, "direct")
+                if best is None or cand.J < best.J:
+                    best = cand
+                break
     return best
 
 
@@ -327,37 +386,59 @@ def _finish(plan, grid, chosen, checker, t0) -> Solution:
 
 def _attempt(plan: Plan, cfg: Config, t0: float, log: list[str]) -> tuple[Solution, int]:
     """One rung pair of the ladder: (solution, 0 = DP over all rings,
-    1 = DP over rings passing every per-ring rule)."""
+    1 = DP over rings passing every per-ring rule).
+
+    Rings are built lazily: first only for groups that can appear in a
+    fewest-hub cover (the answer always has fewest hubs). Every other group is
+    built only if that falls short (a min-cover zone got no ring) or the
+    result fails validation, so the outcome is the same as building all."""
     grid = build_grid(plan, cfg.fill)
     adj = room_adjacency(plan, grid)
     groups = enumerate_groups(plan, adj)
-    solve_all(groups, grid, restrict=True, keep=cfg.keep, block_nodes=cfg.block_nodes)
-    rings = {}
-    for g in groups:
-        try:
-            rg = place_hub(plan, grid, g, cfg.hub_candidates, cfg.block_nodes)
-        except Exception as e:          # one bad zone must not sink the plan
-            log.append(f"hub placement failed for {g.room_ids}: {type(e).__name__}: {e}")
-            continue
-        if rg is not None:
-            rings[g.mask] = rg
-    checker = Checker(plan, grid, adj)
     n = len(plan.rooms)
-    # micro hubs break the 0.5 m hub rule (flagged), so only when nothing else covers the plan
-    strict = {m: rg for m, rg in rings.items() if rg.hub_method != "micro"}
-    chosen = choose_groups(groups, strict, n)
-    if chosen is None and len(strict) < len(rings):
-        chosen = choose_groups(groups, rings, n)
+    h_min, useful = min_cover_groups(groups, n)
+    rings: dict[int, Ring] = {}
+    built: set[int] = set()
+
+    def build(gs):
+        todo = [g for g in gs if g.mask not in built]
+        solve_all(todo, grid, restrict=True, keep=cfg.keep, block_nodes=cfg.block_nodes)
+        for g in todo:
+            built.add(g.mask)
+            try:
+                rg = place_hub(plan, grid, g, cfg.hub_candidates, cfg.block_nodes)
+            except Exception as e:      # one bad zone must not sink the plan
+                log.append(f"hub placement failed for {g.room_ids}: {type(e).__name__}: {e}")
+                continue
+            if rg is not None:
+                rings[g.mask] = rg
+
+    def pick(pool: dict[int, Ring]):
+        # micro hubs break the 0.5 m hub rule (flagged), so only when nothing else covers the plan
+        strict = {m: rg for m, rg in pool.items() if rg.hub_method != "micro"}
+        chosen = choose_groups(groups, strict, n)
+        if chosen is None and len(strict) < len(pool):
+            chosen = choose_groups(groups, pool, n)
+        return chosen
+
+    build(useful)
+    chosen = choose_groups(groups, {m: rg for m, rg in rings.items() if rg.hub_method != "micro"}, n)
+    if chosen is None or len(chosen) > (h_min or 0):
+        build(groups)
+        chosen = pick(rings)
+    checker = Checker(plan, grid, adj)
     sol = _finish(plan, grid, chosen, checker, t0)
     sub = 0
     if not sol.valid:
         log.append("failed: " + ", ".join(k for k, v in sol.checks.items() if v is not True))
+        build(groups)
         good = {m: rg for m, rg in rings.items() if checker.ring_ok(rg)}
-        alt = _finish(plan, grid, choose_groups(groups, good, n), checker, t0)
+        alt = _finish(plan, grid, pick(good), checker, t0)
         if alt.valid or not sol.rings:
             sol, sub = alt, 1
     sol.grid = grid
     sol.lower_bound = hub_lower_bound(plan)
+    sol.zones_built = (len(built), len(groups))
     return sol, sub
 
 
