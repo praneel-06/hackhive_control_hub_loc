@@ -89,6 +89,12 @@ For the full 17,000-plan set, download `ResPlan.pkl` from Kaggle
 - **Compare top 3 groupings:** the three best ways to split the rooms into hub
   zones, side by side, ranked by hubs then J (`hubring.solve.top_solutions`).
 - **Show phases 0 → 9:** every phase's diagram for the current plan.
+- **Photo of a floor plan:** upload a PNG/JPG; walls (auto-detected colour, or
+  click a wall), doors and windows (gaps in straight walls; a gap between two
+  rooms is a door, one to the outside a window) and rooms are found with OpenCV
+  (`app/image_import.py`). You confirm room types and type the flat's total
+  area for the scale (otherwise estimated from door widths), then press Solve.
+- The solver only runs when you press **Solve**; picking a plan just selects it.
 - **Batch view:** solve 100 / 500 / 1,000 / all plans on every core with live
   progress, metric tiles (valid %, hubs and share at the minimum, J, crossings,
   time per plan), a J histogram and a sortable table; click a row to open the plan.

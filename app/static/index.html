@@ -152,6 +152,25 @@ details.valid li { padding: 2px 0; }
 .opt .hubs span.sw { width: 10px; height: 10px; margin: 0; flex: none; }
 .opt .hubs em { font-style: normal; margin-left: auto; font-family: var(--f-mono); font-size: 12px; color: var(--muted); }
 
+/* photo import */
+.photo { display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: 0; flex: 1; overflow: hidden; }
+.photoview { min-width: 0; display: flex; flex-direction: column; background: var(--canvas); border-right: 1px solid var(--line); }
+.photoview svg { flex: 1; width: 100%; min-height: 320px; max-height: 70vh; }
+.photoview svg.picking { cursor: crosshair; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 12px; font-size: 12px; border-top: 1px solid var(--line); background: var(--panel); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.photoside { overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 16px; }
+.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); font-family: var(--f-mono); }
+.swatch { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--line); flex: none; }
+.btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.proom { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 5px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.proom b { font: 700 12px var(--f-mono); text-align: center; border-radius: 4px; padding: 2px 0; color: #fff; }
+.proom select { padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.proom span { font-family: var(--f-mono); font-size: 12px; color: var(--muted); }
+@media (max-width: 1000px) { .photo { grid-template-columns: minmax(0, 1fr); overflow-y: auto; } .photoview { border-right: 0; } }
+
 /* batch view */
 .batch { flex: 1; min-height: 0; overflow-y: auto; padding: 20px; }
 .batch-inner { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
@@ -240,7 +259,8 @@ table.rows tr:hover td { background: var(--bg); cursor: pointer; }
     </div>
     <div class="sec">
       <h4>Photo of a floor plan</h4>
-      <div class="soon">Planned next: upload a picture, check the detected rooms and scale, then solve.</div>
+      <label class="upload" for="photo">Upload a picture (.png, .jpg)<input id="photo" type="file" accept="image/png,image/jpeg"></label>
+      <div class="hint" id="photohint">We find walls, doors and rooms; you check room types and the flat's area.</div>
     </div>
   </aside>
 
@@ -251,7 +271,7 @@ table.rows tr:hover td { background: var(--bg); cursor: pointer; }
       <span class="moved" id="moved" hidden><span id="movedtxt"></span><button class="btn" id="resetdev">Reset devices</button></span>
     </div>
     <svg class="plan" id="plan" role="img" aria-label="Floor plan with hubs and cable rings"></svg>
-    <div class="empty" id="empty">Pick a plan and press Solve</div>
+    <div class="empty" id="empty">Pick a plan ID (or Random), then press Solve</div>
     <div class="toast" id="toast" hidden></div>
     <div class="zoom">
       <button class="btn" id="zin" aria-label="Zoom in">+</button>
@@ -334,6 +354,40 @@ table.rows tr:hover td { background: var(--bg); cursor: pointer; }
     <div class="pfoot">
       <input type="range" id="phRange" min="0" max="0" value="0" aria-label="Phase">
       <span class="pdots" id="phCount"></span>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="photoDlg" hidden role="dialog" aria-modal="true" aria-labelledby="phoTitle">
+  <div class="pbox wide">
+    <div class="phead">
+      <span class="ptitle" id="phoTitle">Check the detected plan</span>
+      <button class="btn" id="phoClose">Cancel</button>
+      <button class="btn primary" id="phoUse">Use this plan</button>
+    </div>
+    <div class="photo">
+      <div class="photoview">
+        <svg id="phoSvg" role="img" aria-label="Uploaded picture with detected rooms"></svg>
+        <div class="legend"><span><i style="background:var(--wall)"></i>wall</span><span><i style="background:#c02bc0"></i>door</span><span><i style="background:#16b3c4"></i>window / outside</span><span class="sub" id="phoHelp">Room numbers match the list.</span></div>
+      </div>
+      <div class="photoside">
+        <div class="sec">
+          <h4>Scale</h4>
+          <label class="field" for="phoArea">Total floor area of the flat (m²)
+            <span class="row"><input id="phoArea" type="number" min="5" step="0.1"><button class="btn" id="phoRedo">Re-detect</button></span></label>
+          <div class="hint" id="phoScale"></div>
+        </div>
+        <div class="sec">
+          <h4>Walls</h4>
+          <div class="row"><span class="swatch" id="phoWall"></span><button class="btn" id="phoPick" aria-pressed="false">Pick wall colour</button></div>
+          <div class="hint">If walls are missed, press the button, then click on a wall in the picture.</div>
+        </div>
+        <div class="sec">
+          <h4>Rooms</h4>
+          <div class="hint" style="margin:0 0 8px">Living, bedroom, kitchen and storage get a device. Bathroom, balcony and other get none and block cable.</div>
+          <div id="phoRooms"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -706,7 +760,7 @@ $("phRange").oninput = e => showPhase(Number(e.target.value));
 $("phClose").onclick = () => $("phases").hidden = true;
 $("phases").addEventListener("click", e => { if (e.target.id === "phases") $("phases").hidden = true; });
 addEventListener("keydown", e => {
-  if (e.key === "Escape") { $("phases").hidden = true; $("top3").hidden = true; return; }
+  if (e.key === "Escape") { $("phases").hidden = true; $("top3").hidden = true; $("photoDlg").hidden = true; return; }
   if (!$("phases").hidden) {
     if (e.key === "ArrowRight") showPhase(phaseIdx + 1);
     if (e.key === "ArrowLeft") showPhase(phaseIdx - 1);
@@ -798,6 +852,73 @@ $("btable").querySelector("tbody").onclick = e => {
 $("bprob").onchange = table;
 $("brun").onclick = runBatch;
 
+// ---------- photo import
+const PTYPES = ["living", "bedroom", "kitchen", "storage", "bathroom", "balcony", "other"];
+const PCOL = { living: "#d99a2b", bedroom: "#3f9a55", kitchen: "#3f6fc9", storage: "#c9643f", bathroom: "#9a5bb5", balcony: "#6aa386", other: "#8a93a0" };
+let photo = null, picking = false;
+function drawPhoto() {
+  const p = photo, s = $("phoSvg"); s.innerHTML = "";
+  const [W, H] = p.size;
+  s.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  el("image", { href: p.image, x: 0, y: 0, width: W, height: H, opacity: .45 }, s);
+  const g = el("g", { transform: `translate(0,${H}) scale(1,-1)` }, s);
+  for (const r of p.rooms) el("path", { d: r.path, fill: PCOL[r.type] || PCOL.other, opacity: .55 }, g);
+  el("path", { d: p.walls, fill: "var(--wall)", opacity: .9 }, g);
+  el("path", { d: p.doors, fill: "#c02bc0" }, g);
+  el("path", { d: p.windows, fill: "#16b3c4" }, g);
+  for (const r of p.rooms) {
+    const [x, y] = r.label_xy;
+    el("circle", { cx: x, cy: H - y, r: 11, fill: PCOL[r.type] || PCOL.other, stroke: "#fff", "stroke-width": 2 }, s);
+    const t = el("text", { x, y: H - y + 4, "text-anchor": "middle", "font-size": 11, "font-weight": 700, fill: "#fff", "font-family": "JetBrains Mono, monospace" }, s);
+    t.textContent = r.i + 1;
+  }
+  $("phoWall").style.background = `rgb(${p.wall_rgb.join(",")})`;
+  const how = { area: "from the area you entered", doors: "estimated from door widths (enter the area for accuracy)", "assumed 100 m²": "assumed 100 m² (no doors found; enter the area)" }[p.scale_from] || p.scale_from;
+  $("phoScale").textContent = `Scale ${p.px_per_m.toFixed(1)} px per m, ${how}. Found ${p.rooms.length} rooms, ${p.n_doors} doors, ${p.n_windows} windows or openings to the outside.`;
+  if (p.scale_from !== "area") $("phoArea").value = p.total_area_m2.toFixed(1);
+  $("phoRooms").innerHTML = p.rooms.map(r => `<div class="proom"><b style="background:${PCOL[r.type] || PCOL.other}">${r.i + 1}</b>
+      <select data-i="${r.i}" aria-label="Type of room ${r.i + 1}">${PTYPES.map(t => `<option ${t === r.type ? "selected" : ""}>${t}</option>`).join("")}</select>
+      <span>${r.area_m2.toFixed(1)} m²</span></div>`).join("") || `<div class="sub">No rooms found. Try picking the wall colour.</div>`;
+  $("phoRooms").querySelectorAll("select").forEach(sel => sel.onchange = () => { photo.rooms[Number(sel.dataset.i)].type = sel.value; drawPhoto(); });
+}
+async function photoCall(fn) {
+  $("phoTitle").textContent = "Detecting…";
+  try { photo = await fn(); $("phoTitle").textContent = "Check the detected plan"; drawPhoto(); }
+  catch (e) { $("phoTitle").textContent = e.message; }
+}
+$("photo").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $("photohint").textContent = `Reading ${f.name}…`;
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    photo = await api("/api/image/detect", { method: "POST", body: fd });
+    $("photoDlg").hidden = false; $("phoArea").value = ""; drawPhoto();
+    $("photohint").textContent = "We find walls, doors and rooms; you check room types and the flat's area.";
+  } catch (err) { $("photohint").textContent = err.message; }
+  e.target.value = "";
+};
+$("phoRedo").onclick = () => photo && photoCall(() => post("/api/image/redetect", { token: photo.token, area_m2: Number($("phoArea").value) || null }));
+$("phoArea").addEventListener("keydown", e => { if (e.key === "Enter") $("phoRedo").click(); });
+$("phoPick").onclick = () => { picking = !picking; $("phoPick").setAttribute("aria-pressed", picking); $("phoSvg").classList.toggle("picking", picking); };
+$("phoSvg").addEventListener("click", ev => {
+  if (!picking || !photo) return;
+  const r = $("phoSvg").getBoundingClientRect(), [W, H] = photo.size;
+  const s = Math.max(W / r.width, H / r.height), ox = (r.width * s - W) / 2, oy = (r.height * s - H) / 2;
+  const x = (ev.clientX - r.left) * s - ox, y = (ev.clientY - r.top) * s - oy;
+  picking = false; $("phoPick").setAttribute("aria-pressed", false); $("phoSvg").classList.remove("picking");
+  photoCall(() => post("/api/image/redetect", { token: photo.token, wall_xy: [x, H - y], area_m2: Number($("phoArea").value) || null }));
+});
+$("phoClose").onclick = () => $("photoDlg").hidden = true;
+$("phoUse").onclick = async () => {
+  if (!photo) return;
+  try {
+    const r = await post("/api/image/build", { token: photo.token, types: photo.rooms.map(x => x.type) });
+    $("photoDlg").hidden = true;
+    await refreshDataset(); selectPlan(r.id);
+    $("pmsg").textContent = "Plan made from your picture. Press Solve.";
+  } catch (e) { $("phoTitle").textContent = e.message; }
+};
+
 // ---------- views & controls
 function setView_(v) {
   $("viewPlan").hidden = v !== "plan"; $("viewBatch").hidden = v !== "batch";
@@ -807,15 +928,25 @@ function setView_(v) {
 }
 $("tabPlan").onclick = () => setView_("plan");
 $("tabBatch").onclick = () => setView_("batch");
+// Picking a plan only fills in the ID; the solver runs when Solve is pressed.
+function selectPlan(pid) {
+  $("pid").value = pid;
+  if (!cur || cur.id !== Number(pid)) {
+    $("ptitle").textContent = `Plan ${pid}`;
+    $("pmsg").textContent = "Press Solve to run the solver"; $("pmsg").className = "msg";
+    $("moved").hidden = true;
+  }
+}
 $("solve").onclick = () => solve();
-$("rand").onclick = async () => solve((await api("/api/random")).id);
+$("pid").addEventListener("input", () => { if ($("pid").value) selectPlan($("pid").value); });
+$("rand").onclick = async () => selectPlan((await api("/api/random")).id);
 function step(dir) {
   if (!ids.length) return;
   const v = Number($("pid").value);
   let i = ids.findIndex(x => x >= v);
   if (i < 0) i = ids.length - 1;
   if (ids[i] === v || dir < 0) i += dir;
-  solve(ids[(i + ids.length) % ids.length]);
+  selectPlan(ids[(i + ids.length) % ids.length]);
 }
 $("prev").onclick = () => step(-1); $("next").onclick = () => step(1);
 $("export").onclick = async () => {
@@ -835,7 +966,7 @@ $("file").onchange = async e => {
   try {
     const r = await api("/api/upload", { method: "POST", body: fd });
     $("uphint").textContent = `Added ${r.added} plan${r.added > 1 ? "s" : ""}.`;
-    await refreshDataset(); solve(r.ids[0]);
+    await refreshDataset(); selectPlan(r.ids[0]);
   } catch (err) { $("uphint").textContent = err.message; }
   e.target.value = "";
 };
@@ -846,7 +977,7 @@ try {
   const last = localStorage.getItem("crp-last"); if (last) $("pid").value = last;
   if (localStorage.getItem("crp-view") === "batch") setView_("batch");
 } catch (e) {}
-refreshDataset().then(() => solve());
+refreshDataset().then(() => selectPlan($("pid").value));
 </script>
 </body>
 </html>

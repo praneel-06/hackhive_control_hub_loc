@@ -304,6 +304,75 @@ async def upload(file: UploadFile = File(...)):
     return {"added": len(raws), "ids": [int(r["id"]) for r in raws][:200]}
 
 
+# ---------------------------------------------------------------- photo import
+IMAGES: dict[str, dict] = {}
+_next_photo_id = [900001]
+
+
+def _photo_payload(token: str) -> dict:
+    import base64
+    import cv2
+    from app.image_import import preview
+    item = IMAGES[token]
+    ok, buf = cv2.imencode(".jpg", item["img"], [cv2.IMWRITE_JPEG_QUALITY, 85])
+    out = preview(item["det"])
+    out.update(token=token, image="data:image/jpeg;base64," + base64.b64encode(buf).decode())
+    return out
+
+
+@app.post("/api/image/detect")
+async def image_detect(file: UploadFile = File(...)):
+    from app.image_import import detect, load_image
+    try:
+        img = load_image(await file.read())
+        det = detect(img)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    token = uuid.uuid4().hex[:10]
+    IMAGES[token] = {"img": img, "det": det, "name": file.filename}
+    return _photo_payload(token)
+
+
+@app.post("/api/image/redetect")
+def image_redetect(body: dict = Body(...)):
+    """Re-run detection with a typed floor area and/or a wall colour picked
+    by clicking the picture (wall_xy in picture pixels, y up)."""
+    from app.image_import import detect
+    item = IMAGES.get(body.get("token"))
+    if item is None:
+        raise HTTPException(404, "Photo expired, upload it again")
+    img = item["img"]
+    rgb = item["det"]["wall_rgb"]
+    if body.get("wall_xy"):
+        x, y = body["wall_xy"]
+        H, W = img.shape[:2]
+        cx, cy = int(np.clip(x, 0, W - 1)), int(np.clip(H - y, 0, H - 1))
+        patch = img[max(0, cy - 1):cy + 2, max(0, cx - 1):cx + 2].reshape(-1, 3)
+        rgb = [int(v) for v in np.median(patch, axis=0)[::-1]]
+    area = body.get("area_m2")
+    try:
+        item["det"] = detect(img, wall_rgb=rgb, area_m2=float(area) if area else None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _photo_payload(body["token"])
+
+
+@app.post("/api/image/build")
+def image_build(body: dict = Body(...)):
+    from app.image_import import build_raw
+    item = IMAGES.get(body.get("token"))
+    if item is None:
+        raise HTTPException(404, "Photo expired, upload it again")
+    pid = _next_photo_id[0]
+    _next_photo_id[0] += 1
+    try:
+        raw = build_raw(item["det"], body.get("types") or [], pid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _add([raw], "uploaded")
+    return {"id": pid}
+
+
 @app.get("/api/phases/{pid}")
 def phases(pid: int):
     raw = _raw(pid)
