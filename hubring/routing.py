@@ -31,39 +31,76 @@ HEADINGS = "ENWS"
 BEND_COST = 0.5
 
 
+@dataclass
+class StateGraphParts:
+    """Edges of the heading-state graph, kept apart so weights can be changed
+    (e.g. collision penalties) and the matrix rebuilt cheaply."""
+    n_states: int
+    move_rows: np.ndarray
+    move_cols: np.ndarray
+    move_len: np.ndarray
+    move_edge: np.ndarray      # grid edge id of each move
+    move_dst: np.ndarray       # grid point a move enters
+    turn_rows: np.ndarray
+    turn_cols: np.ndarray
+
+    def matrix(self, move_w: np.ndarray | None = None, extra: tuple | None = None) -> sp.csr_matrix:
+        """CSR matrix; move_w overrides move weights; extra = (rows, cols,
+        vals, n_extra_states) appends edges from additional states."""
+        w = self.move_len if move_w is None else move_w
+        rows = [self.move_rows, self.turn_rows]
+        cols = [self.move_cols, self.turn_cols]
+        vals = [w, np.full(len(self.turn_rows), BEND_COST)]
+        n = self.n_states
+        if extra is not None:
+            rows.append(extra[0]); cols.append(extra[1]); vals.append(extra[2]); n += extra[3]
+        # All weights are > 0, so scipy's "explicit zero = no edge" rule never bites.
+        return sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                             shape=(n, n))
+
+
+def state_graph_parts(grid: Grid, allowed: np.ndarray | None = None) -> StateGraphParts:
+    P = len(grid.pts)
+    eid = np.arange(len(grid.edges))
+    a, b = grid.edges[:, 0], grid.edges[:, 1]
+    d = grid.pts[b] - grid.pts[a]
+    # Heading of travel a→b; travel b→a is the opposite heading.
+    fwd = np.where(grid.horizontal, np.where(d[:, 0] > 0, E, W), np.where(d[:, 1] > 0, N, S))
+    rev = (fwd + 2) % 4
+    length = grid.lengths
+    if allowed is not None:
+        keep = allowed[a] & allowed[b]
+        a, b, fwd, rev, length, eid = a[keep], b[keep], fwd[keep], rev[keep], length[keep], eid[keep]
+
+    # Turn edges between every pair of headings at every point.
+    p = np.arange(P)
+    h1, h2 = np.array([(i, j) for i in range(4) for j in range(4) if i != j]).T
+    return StateGraphParts(
+        n_states=4 * P,
+        move_rows=np.concatenate([a * 4 + fwd, b * 4 + rev]),
+        move_cols=np.concatenate([b * 4 + fwd, a * 4 + rev]),
+        move_len=np.concatenate([length, length]),
+        move_edge=np.concatenate([eid, eid]),
+        move_dst=np.concatenate([b, a]),
+        turn_rows=(p[:, None] * 4 + h1[None, :]).ravel(),
+        turn_cols=(p[:, None] * 4 + h2[None, :]).ravel(),
+    )
+
+
 def build_state_graph(grid: Grid, allowed: np.ndarray | None = None) -> sp.csr_matrix:
     """Directed graph over 4·P heading states.
 
     allowed: optional (P,) bool mask of usable grid points, e.g. to keep a
     ring inside its own group's rooms. Edges touching a masked point vanish.
     """
-    P = len(grid.pts)
-    a, b = grid.edges[:, 0], grid.edges[:, 1]
-    d = grid.pts[b] - grid.pts[a]
-    # Heading of travel a→b; travel b→a is the opposite heading.
-    fwd = np.where(grid.horizontal, np.where(d[:, 0] > 0, E, W), np.where(d[:, 1] > 0, N, S))
-    rev = (fwd + 2) % 4
-    if allowed is not None:
-        keep = allowed[a] & allowed[b]
-        a, b, fwd, rev, length = a[keep], b[keep], fwd[keep], rev[keep], grid.lengths[keep]
-    else:
-        length = grid.lengths
+    return state_graph_parts(grid, allowed).matrix()
 
-    rows = [a * 4 + fwd, b * 4 + rev]
-    cols = [b * 4 + fwd, a * 4 + rev]
-    vals = [length, length]
 
-    # Turn edges between every pair of headings at every point.
-    p = np.arange(P)
-    for h1 in range(4):
-        for h2 in range(4):
-            if h1 != h2:
-                rows.append(p * 4 + h1)
-                cols.append(p * 4 + h2)
-                vals.append(np.full(P, BEND_COST))
-    # All weights are > 0, so scipy's "explicit zero = no edge" rule never bites.
-    return sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                         shape=(4 * P, 4 * P))
+def states_to_polyline(grid: Grid, states) -> np.ndarray:
+    """Corner points of a state path (turn-in-place repeats dropped)."""
+    pts = grid.pts[np.asarray(states) // 4]
+    pts = pts[np.r_[True, np.any(np.diff(pts, axis=0) != 0, axis=1)]]
+    return simplify(pts)
 
 
 @dataclass
@@ -92,9 +129,7 @@ class RouteTable:
 
     def polyline(self, a: int, s: int, b: int, e: int) -> np.ndarray:
         """Route as corner points only (start, each bend, end), metres."""
-        pts = self.grid.pts[np.array(self.path_states(a, s, b, e)) // 4]
-        pts = pts[np.r_[True, np.any(np.diff(pts, axis=0) != 0, axis=1)]]   # drop turn-in-place repeats
-        return simplify(pts)
+        return states_to_polyline(self.grid, self.path_states(a, s, b, e))
 
     def best(self, a: int, b: int) -> tuple[float, int, int]:
         """Cheapest leg a→b over all leave/arrive headings: (cost, s, e)."""

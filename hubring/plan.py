@@ -86,6 +86,24 @@ def place_node(poly: Polygon | MultiPolygon) -> tuple[float, float]:
     return (p.x, p.y)
 
 
+def _carve_overlaps(shapes: list[tuple[str, str, Polygon]]) -> list[tuple[str, str, Polygon]]:
+    """Cut each room out of every larger room it overlaps.
+
+    ResPlan often draws a storage closet (or stair) inside the living-room or
+    kitchen polygon. Without carving, its area is counted twice and the
+    smaller room gets no grid points of its own."""
+    order = sorted(range(len(shapes)), key=lambda i: shapes[i][2].area)
+    out = list(shapes)
+    for k, i in enumerate(order):
+        nid, rtype, geom = out[i]
+        smaller = [out[j][2] for j in order[:k] if out[j][2].intersects(geom)]
+        if smaller:
+            cut = shapely.make_valid(geom.difference(unary_union(smaller)))
+            parts = [p for p in getattr(cut, "geoms", [cut]) if isinstance(p, Polygon) and p.area > 1e-4]
+            out[i] = (nid, rtype, parts[0] if len(parts) == 1 else MultiPolygon(parts))
+    return out
+
+
 def build_plan(raw: dict, exclude_from_free: bool = True) -> Plan:
     """Parse one ResPlan dict into a metre-scale Plan.
 
@@ -96,13 +114,16 @@ def build_plan(raw: dict, exclude_from_free: bool = True) -> Plan:
     scale = (raw["inner"].area / raw["area"]) ** 0.5
 
     G_units = plan_to_graph(raw)
+    shapes = [(nid, data["type"], _to_m(data["geometry"], scale))
+              for nid, data in G_units.nodes(data=True)
+              if data["type"] in ELIGIBLE + EXCLUDED]
+    shapes = _carve_overlaps(shapes)
     rooms: list[Room] = []
     excluded: list[tuple[str, Polygon]] = []
-    for nid, data in G_units.nodes(data=True):
-        geom = _to_m(data["geometry"], scale)
-        if data["type"] in ELIGIBLE:
-            rooms.append(Room(nid, data["type"], geom, geom.area, place_node(geom)))
-        elif data["type"] in EXCLUDED:
+    for nid, rtype, geom in shapes:
+        if rtype in ELIGIBLE:
+            rooms.append(Room(nid, rtype, geom, geom.area, place_node(geom)))
+        else:
             excluded.append((nid, geom))
     # garden/pool/parking/land are outside `inner` (land is the whole plot and
     # covers the building), so they never need subtracting.

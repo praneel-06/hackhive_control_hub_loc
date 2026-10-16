@@ -18,6 +18,7 @@ from .plan import Plan
 WALL_OFFSET_M = 0.15   # run cable this far inside a room's wall
 FILL_SPACING_M = 1.0   # max gap between grid lines in open areas
 MERGE_M = 0.05         # lines closer than this merge into one
+DOOR_LANE_M = 0.15     # side lanes either side of a door centre line
 
 # Line priorities: when two lines merge, the higher one keeps its position.
 PRI_NODE, PRI_DOOR, PRI_WALL, PRI_FILL = 3, 2, 1, 0
@@ -90,6 +91,15 @@ def build_grid(plan: Plan) -> Grid:
         c = d.centroid
         xl.append((c.x, PRI_DOOR))
         yl.append((c.y, PRI_DOOR))
+        # Side lanes so two cables (out and back) fit through one door on
+        # parallel lines instead of overlapping.
+        bx0, by0, bx1, by1 = d.bounds
+        if bx1 - bx0 >= by1 - by0:      # door in a horizontal wall: cable crosses vertically
+            lane = min(DOOR_LANE_M, 0.3 * (bx1 - bx0))
+            xl += [(c.x - lane, PRI_DOOR), (c.x + lane, PRI_DOOR)]
+        else:
+            lane = min(DOOR_LANE_M, 0.3 * (by1 - by0))
+            yl += [(c.y - lane, PRI_DOOR), (c.y + lane, PRI_DOOR)]
 
     x0, y0, x1, y1 = plan.inner.bounds
     xs = _merge(xl, x0, x1)
