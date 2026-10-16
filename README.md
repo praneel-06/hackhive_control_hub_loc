@@ -73,6 +73,20 @@ python3 -m venv .venv
 For the full 17,000-plan set, download `ResPlan.pkl` from Kaggle
 (kaggle.com/datasets/resplan/resplan) into `archive (1)/`.
 
+## Web UI (localhost)
+
+```bash
+.venv/bin/python -m uvicorn app.server:app --port 8000    # then open http://localhost:8000
+```
+
+Pick a plan ID (or Random, or load a ResPlan `.pkl`) and press Solve: the plan
+is drawn with zones, rings, hubs and devices; hover any room or ring for its
+numbers. Layers switch the routing grid and room graph on, the right panel shows
+hubs vs. the lower bound, J and its parts, all 12 rule checks and one row per
+hub, and "Show phases 0 → 9" steps through every phase's diagram for that plan.
+The full `ResPlan.pkl` (if present) loads in the background; the 300-plan
+sample is available at once.
+
 ## Run
 
 ```bash

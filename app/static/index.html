@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cable Ring Planner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: top bar · left controls · plan canvas · right results. One primary action (Solve). */
+:root {
+  --bg: #f3f6fa; --panel: #ffffff; --ink: #1c2633; --muted: #5b6878; --line: #dce3ec;
+  --accent: #2a62c9; --accent-ink: #ffffff; --ok: #2e7d3e; --ok-soft: #e3f3e6; --bad: #c0392b; --bad-soft: #fbe6e3;
+  --warn: #b26a00; --warn-soft: #fdf0dc;
+  --canvas: #fbfcfe; --wall: #343b45; --door: #c99ac9; --window: #7fc8f8; --excl: #e9ecf0;
+  --t-living: #f4e3c4; --t-bedroom: #d3ecd8; --t-kitchen: #d5e2f6; --t-storage: #f8d9cc;
+  --grid: #8a96a6; --graph: #1f4e9c;
+  --f-brand: "Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+  --f-body: "Atkinson Hyperlegible", "Segoe UI", Helvetica, Arial, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f141a; --panel: #161d26; --ink: #e3e9f1; --muted: #98a6b8; --line: #2a3442;
+  --accent: #6f9cf0; --accent-ink: #0f141a; --ok: #7cc98b; --ok-soft: #1b2e21; --bad: #ef8a7d; --bad-soft: #3a1f1c;
+  --warn: #f0b45c; --warn-soft: #33281a;
+  --canvas: #121922; --wall: #cfd6df; --door: #a77aa7; --window: #4f9fd6; --excl: #1f2731;
+  --t-living: #3a3223; --t-bedroom: #22362a; --t-kitchen: #22304a; --t-storage: #3d2a24;
+  --grid: #5d6a7c; --graph: #8fb3f5; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f141a; --panel: #161d26; --ink: #e3e9f1; --muted: #98a6b8; --line: #2a3442;
+  --accent: #6f9cf0; --accent-ink: #0f141a; --ok: #7cc98b; --ok-soft: #1b2e21; --bad: #ef8a7d; --bad-soft: #3a1f1c;
+  --warn: #f0b45c; --warn-soft: #33281a;
+  --canvas: #121922; --wall: #cfd6df; --door: #a77aa7; --window: #4f9fd6; --excl: #1f2731;
+  --t-living: #3a3223; --t-bedroom: #22362a; --t-kitchen: #22304a; --t-storage: #3d2a24;
+  --grid: #5d6a7c; --graph: #8fb3f5; color-scheme: dark }
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--f-body); display: flex; flex-direction: column; }
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header { display: flex; align-items: center; gap: 14px; padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.brand { font: 800 19px var(--f-brand); letter-spacing: -.01em; margin-right: 6px; }
+.brand span { color: var(--accent); }
+.pick { display: flex; align-items: center; gap: 6px; }
+.pick label { font-size: 13px; color: var(--muted); }
+.pick input { width: 96px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); font-family: var(--f-mono); }
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 6px 12px; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 700; padding: 6px 18px; }
+.btn:disabled { opacity: .5; cursor: default; }
+.badge { font: 600 12px var(--f-mono); padding: 4px 9px; border-radius: 99px; background: var(--bg); color: var(--muted); border: 1px solid var(--line); white-space: nowrap; }
+.badge.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+.spacer { flex: 1; }
+.dataset { font-size: 12px; color: var(--muted); }
+
+.app { flex: 1; min-height: 0; display: grid; grid-template-columns: 230px minmax(0, 1fr) 320px; }
+aside { background: var(--panel); overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 18px; }
+aside.left { border-right: 1px solid var(--line); }
+aside.right { border-left: 1px solid var(--line); }
+.sec h4 { margin: 0 0 8px; font: 600 11px var(--f-mono); letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.upload { display: block; border: 1px dashed var(--line); border-radius: 8px; padding: 10px; text-align: center; font-size: 13px; color: var(--muted); cursor: pointer; }
+.upload:hover { border-color: var(--accent); color: var(--accent); }
+.upload input { display: none; }
+.hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.layers label { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 14px; cursor: pointer; }
+.layers input { accent-color: var(--accent); }
+.soon { font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+
+.stage { position: relative; min-width: 0; display: flex; flex-direction: column; }
+.stagebar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--bg); flex-wrap: wrap; }
+.stagebar .title { font-weight: 700; }
+.stagebar .msg { font-size: 13px; color: var(--muted); }
+.stagebar .msg.bad { color: var(--bad); }
+svg#plan { flex: 1; width: 100%; min-height: 300px; background: var(--canvas); touch-action: none; cursor: grab; }
+svg#plan.panning { cursor: grabbing; }
+.zoom { position: absolute; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 4px; }
+.zoom .btn { width: 34px; padding: 4px 0; background: var(--panel); }
+.empty { position: absolute; inset: 60px 0 0 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; text-align: center; }
+
+#tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.12); max-width: 260px; z-index: 20; }
+#tip b { display: block; margin-bottom: 2px; }
+#tip .mono { font-family: var(--f-mono); font-size: 12px; }
+
+.score { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.score > div { background: var(--bg); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.big { font: 800 30px/1.1 var(--f-brand); font-variant-numeric: tabular-nums; }
+.sub { font-size: 12px; color: var(--muted); }
+.parts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
+.parts div { background: var(--bg); border-radius: 6px; padding: 6px; text-align: center; }
+.parts b { display: block; font: 600 15px var(--f-mono); font-variant-numeric: tabular-nums; }
+.parts span { font-size: 11px; color: var(--muted); }
+details.valid { border-radius: 8px; padding: 10px 12px; }
+details.valid.ok { background: var(--ok-soft); }
+details.valid.bad { background: var(--bad-soft); }
+details.valid.warn { background: var(--warn-soft); }
+details.valid summary { cursor: pointer; font-weight: 700; list-style: none; }
+details.valid summary::-webkit-details-marker { display: none; }
+details.valid.ok summary { color: var(--ok); }
+details.valid.bad summary { color: var(--bad); }
+details.valid.warn summary { color: var(--warn); }
+details.valid ul { margin: 8px 0 0; padding: 0; list-style: none; font-size: 13px; }
+details.valid li { padding: 2px 0; }
+.hub { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 4px 10px; align-items: start; padding: 10px 0; border-top: 1px solid var(--line); }
+.hub:first-child { border-top: 0; }
+.sw { width: 14px; height: 14px; border-radius: 3px; margin-top: 3px; }
+.hub .rooms { font-weight: 700; font-size: 14px; }
+.hub .j { font: 600 14px var(--f-mono); text-align: right; }
+.bar { grid-column: 2 / 4; height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 3px; }
+.meta { grid-column: 2 / 4; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.log { font-size: 12px; color: var(--muted); }
+.log summary { cursor: pointer; }
+
+#phases { position: fixed; inset: 0; background: rgba(10, 14, 20, .72); display: flex; align-items: center; justify-content: center; z-index: 30; padding: 16px; }
+.pbox { background: var(--panel); border-radius: 12px; width: min(1100px, 100%); max-height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.phead { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.phead .ptitle { font-weight: 700; flex: 1; min-width: 160px; }
+.pimg { flex: 1; min-height: 0; overflow: auto; background: #ffffff; display: grid; place-items: center; padding: 10px; }
+.pimg img { max-width: 100%; max-height: 72vh; display: block; }
+.pfoot { display: flex; gap: 10px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--line); }
+.pfoot input[type=range] { flex: 1; accent-color: var(--accent); }
+.pdots { font: 600 12px var(--f-mono); color: var(--muted); min-width: 60px; text-align: right; }
+
+@media (max-width: 1000px) {
+  .app { grid-template-columns: minmax(0, 1fr); grid-auto-rows: auto; overflow-y: auto; }
+  aside.left, aside.right { border: 0; border-top: 1px solid var(--line); }
+  .stage { min-height: 70vh; order: -1; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Cable <span>Ring</span> Planner</div>
+  <div class="pick">
+    <label for="pid">Plan ID</label>
+    <input id="pid" type="number" min="0" value="10324" aria-label="Plan ID">
+    <button class="btn" id="prev" title="Previous plan in the list" aria-label="Previous plan">‹</button>
+    <button class="btn" id="next" title="Next plan in the list" aria-label="Next plan">›</button>
+    <button class="btn" id="rand">Random</button>
+  </div>
+  <button class="btn primary" id="solve">Solve</button>
+  <span class="badge" id="timing">not solved yet</span>
+  <div class="spacer"></div>
+  <span class="dataset" id="dataset">loading plans…</span>
+</header>
+
+<div class="app">
+  <aside class="left">
+    <div class="sec">
+      <h4>Input</h4>
+      <label class="upload" for="file">Load ResPlan file (.pkl)<input id="file" type="file" accept=".pkl,.pickle"></label>
+      <div class="hint" id="uphint">One plan or a list of plans. Only load files you trust.</div>
+    </div>
+    <div class="sec layers">
+      <h4>Layers</h4>
+      <label><input type="checkbox" data-layer="zones" checked> Zones</label>
+      <label><input type="checkbox" data-layer="rings" checked> Cable rings</label>
+      <label><input type="checkbox" data-layer="hubs" checked> Hubs</label>
+      <label><input type="checkbox" data-layer="devices" checked> Devices</label>
+      <label><input type="checkbox" data-layer="labels" checked> Room labels</label>
+      <label><input type="checkbox" data-layer="grid"> Routing grid</label>
+      <label><input type="checkbox" data-layer="graph"> Room graph</label>
+    </div>
+    <div class="sec">
+      <h4>How it was solved</h4>
+      <button class="btn" id="phasebtn" style="width:100%" disabled>Show phases 0 → 9</button>
+      <div class="hint">Draws every step for this plan (about 2 s the first time).</div>
+    </div>
+    <div class="sec">
+      <h4>Photo of a floor plan</h4>
+      <div class="soon">Planned next: upload a picture, check the detected rooms and scale, then solve.</div>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <div class="stagebar">
+      <span class="title" id="ptitle">—</span>
+      <span class="msg" id="pmsg"></span>
+    </div>
+    <svg id="plan" role="img" aria-label="Floor plan with hubs and cable rings"></svg>
+    <div class="empty" id="empty">Pick a plan and press Solve</div>
+    <div class="zoom">
+      <button class="btn" id="zin" aria-label="Zoom in">+</button>
+      <button class="btn" id="zout" aria-label="Zoom out">−</button>
+      <button class="btn" id="zfit" aria-label="Fit plan" title="Fit">⤢</button>
+    </div>
+  </main>
+
+  <aside class="right">
+    <div class="sec">
+      <h4>Score</h4>
+      <div class="score">
+        <div><div class="big" id="sH">–</div><div class="sub" id="sHsub">hubs</div></div>
+        <div><div class="big" id="sJ">–</div><div class="sub">cost J</div></div>
+      </div>
+      <div class="parts">
+        <div><b id="sL">–</b><span>length m</span></div>
+        <div><b id="sB">–</b><span>bends</span></div>
+        <div><b id="sX">–</b><span>crossings</span></div>
+        <div><b id="sO">–</b><span>overlap m</span></div>
+      </div>
+      <div class="sub" style="margin-top:6px">J = L + 5·X + O + 0.5·B</div>
+    </div>
+    <details class="valid" id="valid"><summary id="vsum">–</summary><ul id="vlist"></ul></details>
+    <div class="sec">
+      <h4>Hubs</h4>
+      <div id="hubs"><div class="sub">–</div></div>
+    </div>
+    <div class="sec">
+      <button class="btn" id="export" style="width:100%" disabled>Export solution JSON</button>
+    </div>
+    <details class="log" id="logbox" hidden><summary>Notes from the solver</summary><ul id="loglist"></ul></details>
+  </aside>
+</div>
+
+<div id="tip" hidden></div>
+
+<div id="phases" hidden role="dialog" aria-modal="true" aria-labelledby="phTitle">
+  <div class="pbox">
+    <div class="phead">
+      <span class="ptitle" id="phTitle">Phases</span>
+      <button class="btn" id="phPrev" aria-label="Previous phase">‹ Prev</button>
+      <button class="btn" id="phNext" aria-label="Next phase">Next ›</button>
+      <button class="btn" id="phClose">Close</button>
+    </div>
+    <div class="pimg"><img id="phImg" alt=""></div>
+    <div class="pfoot">
+      <input type="range" id="phRange" min="0" max="0" value="0" aria-label="Phase">
+      <span class="pdots" id="phCount"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+const ZONE = [["#2a62c9", "#dbe7fb"], ["#e0751f", "#fde3cc"], ["#2e8b3e", "#d9f0dc"], ["#a8459a", "#f3dcef"],
+              ["#c79a00", "#fff2c2"], ["#178f9c", "#dcf3f5"], ["#c0392b", "#f8dcd8"], ["#5b5bd6", "#e3e3fa"]];
+const $ = id => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+const svg = $("plan");
+let ids = [], cur = null, view = null, home = null, phaseList = [], phaseIdx = 0;
+
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const fmt = (v, d = 2) => (v == null ? "–" : Number(v).toFixed(d));
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m; } catch (e) {} throw new Error(m); }
+  return r.json();
+}
+
+// ---------- dataset
+async function refreshDataset() {
+  try {
+    const s = await api("/api/status");
+    let t = `${s.plans.toLocaleString()} plans`;
+    if (s.full_loading) t += " · loading full dataset…";
+    else if (s.full) t += " · full ResPlan";
+    else t += " · 300-plan sample";
+    if (s.uploaded) t += ` · ${s.uploaded} uploaded`;
+    $("dataset").textContent = t;
+    ids = (await api("/api/plans")).ids;
+    if (s.full_loading) setTimeout(refreshDataset, 3000);
+  } catch (e) { $("dataset").textContent = "server not reachable"; }
+}
+
+// ---------- solve
+async function solve(pid) {
+  pid = Number(pid ?? $("pid").value);
+  if (!Number.isFinite(pid)) return;
+  $("pid").value = pid;
+  $("phases").hidden = true;
+  $("solve").disabled = true; $("timing").textContent = "solving…"; $("timing").className = "badge";
+  const t0 = performance.now();
+  try {
+    const d = await api(`/api/solve/${pid}`);
+    const rt = (performance.now() - t0) / 1000;
+    cur = d;
+    $("timing").textContent = `solved in ${d.solve_s.toFixed(2)} s · shown in ${rt.toFixed(2)} s`;
+    $("timing").className = "badge ok";
+    draw(d); panel(d);
+    $("phasebtn").disabled = false; $("export").disabled = false;
+    try { localStorage.setItem("crp-last", String(pid)); } catch (e) {}
+  } catch (e) {
+    $("timing").textContent = "error"; $("ptitle").textContent = `Plan ${pid}`;
+    $("pmsg").textContent = e.message; $("pmsg").className = "msg bad";
+  } finally { $("solve").disabled = false; }
+}
+
+// ---------- canvas
+function draw(d) {
+  svg.innerHTML = ""; $("empty").hidden = true;
+  const [x0, y0, x1, y1] = d.bounds, pad = 0.8;
+  home = [x0 - pad, -(y1 + pad), x1 - x0 + 2 * pad, y1 - y0 + 2 * pad];
+  setView(home.slice());
+  const g = el("g", { transform: "scale(1,-1)" }, svg);         // plan coordinates: y up
+  const L = name => el("g", { "data-layer": name }, g);
+  const css = getComputedStyle(document.documentElement);
+  const tcol = t => css.getPropertyValue(`--t-${t}`) || css.getPropertyValue("--t-living");
+
+  const rooms = L("rooms");
+  for (const r of d.rooms) {
+    const p = el("path", { d: r.path, fill: tcol(r.type), "data-room": r.i }, rooms);
+    p.addEventListener("pointermove", ev => tip(ev, roomTip(r)));
+    p.addEventListener("pointerleave", hideTip);
+  }
+  const zones = L("zones");
+  for (const r of d.rooms) if (r.zone != null)
+    el("path", { d: r.path, fill: ZONE[r.zone % ZONE.length][0], "pointer-events": "none", opacity: .2 }, zones);
+  const excl = el("g", {}, g);
+  for (const x of d.excluded) {
+    const p = el("path", { d: x.path, fill: "var(--excl)" }, excl);
+    p.addEventListener("pointermove", ev => tip(ev, `<b>${x.type}</b>No device, no cable`));
+    p.addEventListener("pointerleave", hideTip);
+  }
+  const struct = el("g", { "pointer-events": "none" }, g);
+  el("path", { d: d.walls, fill: "var(--wall)" }, struct);
+  el("path", { d: d.windows, fill: "var(--window)" }, struct);
+  el("path", { d: d.doors, fill: "var(--door)" }, struct);
+
+  const grid = L("grid");
+  if (d.grid) {
+    let s = "";
+    for (const [a, b, c, e] of d.grid) s += `M${a},${b}L${c},${e}`;
+    el("path", { d: s, stroke: "var(--grid)", "stroke-width": 1, "vector-effect": "non-scaling-stroke", fill: "none", "pointer-events": "none" }, grid);
+  }
+  const graph = L("graph");
+  for (const [u, v, via] of d.graph) {
+    const a = d.rooms[u].node, b = d.rooms[v].node;
+    el("line", { x1: a[0], y1: a[1], x2: b[0], y2: b[1], stroke: "var(--graph)", "stroke-width": 0.12,
+                 "stroke-dasharray": via === "door" ? "" : "0.3 0.2", "stroke-linecap": "round", opacity: .85 }, graph);
+  }
+
+  const rings = L("rings");
+  for (const h of d.hubs) {
+    const c = ZONE[h.k % ZONE.length][0];
+    const pts = h.ring.map(p => p.join(",")).join(" ");
+    el("polyline", { points: pts, fill: "none", stroke: c, "stroke-width": 0.09, "stroke-linejoin": "miter", "pointer-events": "none" }, rings);
+    const hit = el("polyline", { points: pts, fill: "none", stroke: "transparent", "stroke-width": 0.5 }, rings);
+    hit.addEventListener("pointermove", ev => tip(ev, ringTip(h)));
+    hit.addEventListener("pointerleave", hideTip);
+  }
+  const devs = L("devices");
+  const devRing = {};
+  d.hubs.forEach(h => h.room_idx.forEach((ri, j) => devRing[ri] = [h.k, j + 1]));
+  for (const r of d.rooms) {
+    const z = devRing[r.i];
+    const c = z ? ZONE[z[0] % ZONE.length][0] : "#d62728";
+    const dot = el("circle", { cx: r.node[0], cy: r.node[1], r: 0.2, fill: c, stroke: "#fff", "stroke-width": 0.06 }, devs);
+    dot.addEventListener("pointermove", ev => tip(ev, roomTip(r, true)));
+    dot.addEventListener("pointerleave", hideTip);
+  }
+  const hubs = L("hubs");
+  for (const h of d.hubs) {
+    const c = ZONE[h.k % ZONE.length][0], s = 0.34;
+    const sq = el("rect", { x: h.hub[0] - s / 2, y: h.hub[1] - s / 2, width: s, height: s, fill: c, stroke: "#111", "stroke-width": 0.05 }, hubs);
+    sq.addEventListener("pointermove", ev => tip(ev, ringTip(h)));
+    sq.addEventListener("pointerleave", hideTip);
+  }
+
+  // text lives outside the flipped group so it reads upright
+  const labels = el("g", { "data-layer": "labels", "pointer-events": "none" }, svg);
+  for (const r of d.rooms) {
+    const t = el("text", { x: r.node[0], y: -r.node[1] + 0.62, "text-anchor": "middle", "font-size": 0.36,
+                           fill: "var(--ink)", "font-family": "Atkinson Hyperlegible, sans-serif" }, labels);
+    t.textContent = `${r.name} · ${r.area.toFixed(1)} m²`;
+  }
+  const hl = el("g", { "data-layer": "hubs", "pointer-events": "none" }, svg);
+  for (const h of d.hubs) {
+    const t = el("text", { x: h.hub[0], y: -h.hub[1] + 0.11, "text-anchor": "middle", "font-size": 0.24, "font-weight": 700,
+                           fill: "#fff", "font-family": "JetBrains Mono, monospace" }, hl);
+    t.textContent = `H${h.k + 1}`;
+  }
+  const dl = el("g", { "data-layer": "devices", "pointer-events": "none" }, svg);
+  for (const r of d.rooms) {
+    const z = devRing[r.i]; if (!z) continue;
+    const t = el("text", { x: r.node[0], y: -r.node[1] + 0.07, "text-anchor": "middle", "font-size": 0.18, "font-weight": 700,
+                           fill: "#fff", "font-family": "JetBrains Mono, monospace" }, dl);
+    t.textContent = `N${z[1]}`;
+  }
+  applyLayers();
+}
+
+function applyLayers() {
+  document.querySelectorAll(".layers input").forEach(cb => {
+    svg.querySelectorAll(`[data-layer="${cb.dataset.layer}"]`).forEach(g => g.style.display = cb.checked ? "" : "none");
+  });
+  try { localStorage.setItem("crp-layers", JSON.stringify([...document.querySelectorAll(".layers input")].map(c => c.checked))); } catch (e) {}
+}
+
+function roomTip(r, dev) {
+  const z = r.zone != null ? `Hub H${r.zone + 1}` : "no hub";
+  const clr = r.clearance < 0.5 ? ` <span style="color:var(--warn)">(narrow room: ${r.clearance.toFixed(2)} m)</span>` : "";
+  return `<b>${r.name}</b>${r.area.toFixed(2)} m² · ${z}<br><span class="mono">device (${fmt(r.node[0])}, ${fmt(r.node[1])}) m</span>${dev ? clr : ""}`;
+}
+function ringTip(h) {
+  const m = h.metrics;
+  return `<b>Hub H${h.k + 1}: ${h.rooms.join(" → ")}</b><span class="mono">J ${fmt(m.J)} = L ${fmt(m.L)} + 0.5·${m.B} bends + 5·${m.X} + ${fmt(m.O)}</span><br>${h.area.toFixed(1)} m² · ${h.devices} devices · hub (${fmt(h.hub[0])}, ${fmt(h.hub[1])}) m`;
+}
+function tip(ev, html) {
+  const t = $("tip"); t.innerHTML = html; t.hidden = false;
+  const w = t.offsetWidth, hgt = t.offsetHeight;
+  t.style.left = Math.min(ev.clientX + 14, innerWidth - w - 8) + "px";
+  t.style.top = Math.min(ev.clientY + 14, innerHeight - hgt - 8) + "px";
+}
+function hideTip() { $("tip").hidden = true; }
+
+// ---------- pan & zoom (viewBox)
+function setView(v) { view = v; svg.setAttribute("viewBox", v.join(" ")); }
+function zoom(f, cx, cy) {
+  if (!view) return;
+  const [x, y, w, h] = view;
+  cx = cx ?? x + w / 2; cy = cy ?? y + h / 2;
+  setView([cx - (cx - x) * f, cy - (cy - y) * f, w * f, h * f]);
+}
+function toPlan(ev) {
+  const r = svg.getBoundingClientRect(), [x, y, w, h] = view;
+  const s = Math.max(w / r.width, h / r.height);
+  const ox = x + (w - r.width * s) / 2, oy = y + (h - r.height * s) / 2;
+  return [ox + (ev.clientX - r.left) * s, oy + (ev.clientY - r.top) * s, s];
+}
+svg.addEventListener("wheel", ev => { ev.preventDefault(); const [px, py] = toPlan(ev); zoom(ev.deltaY > 0 ? 1.15 : 1 / 1.15, px, py); }, { passive: false });
+let drag = null;
+svg.addEventListener("pointerdown", ev => { if (!view) return; drag = [ev.clientX, ev.clientY, view.slice(), toPlan(ev)[2]]; svg.classList.add("panning"); });
+addEventListener("pointermove", ev => { if (!drag) return; const [sx, sy, v, s] = drag; setView([v[0] - (ev.clientX - sx) * s, v[1] - (ev.clientY - sy) * s, v[2], v[3]]); });
+addEventListener("pointerup", () => { drag = null; svg.classList.remove("panning"); });
+$("zin").onclick = () => zoom(1 / 1.3); $("zout").onclick = () => zoom(1.3); $("zfit").onclick = () => home && setView(home.slice());
+
+// ---------- right panel
+function panel(d) {
+  $("ptitle").textContent = `Plan ${d.id}`;
+  const msg = $("pmsg");
+  if (d.status === "infeasible") { msg.textContent = "No valid answer exists: " + d.log.join("; "); msg.className = "msg bad"; }
+  else if (d.status === "partial") { msg.textContent = "No valid answer found for this plan"; msg.className = "msg bad"; }
+  else { msg.textContent = `${d.rooms.length} rooms with devices · ${d.excluded.length} excluded`; msg.className = "msg"; }
+
+  const m = d.metrics, ok = d.H > 0;
+  $("sH").textContent = ok ? d.H : "–";
+  $("sHsub").textContent = d.lower_bound == null ? "hubs" :
+    (d.H === d.lower_bound ? `hubs · minimum ${d.lower_bound} ✓` : `hubs · lower bound ${d.lower_bound}`);
+  $("sJ").textContent = ok ? fmt(m.J) : "–";
+  $("sL").textContent = ok ? fmt(m.L, 1) : "–"; $("sB").textContent = ok ? m.B : "–";
+  $("sX").textContent = ok ? m.X : "–"; $("sO").textContent = ok ? fmt(m.O, 1) : "–";
+
+  const v = $("valid"), checks = Object.entries(d.checks);
+  const flagged = d.log.some(s => s.includes("clearance only"));
+  v.className = "valid " + (d.valid ? (flagged ? "warn" : "ok") : "bad");
+  const pass = checks.filter(([, x]) => x === true).length;
+  $("vsum").textContent = d.valid ? `✓ Valid · ${pass}/${checks.length} rule checks pass${flagged ? " (flagged)" : ""}`
+                                  : `✗ Not valid · ${pass}/${checks.length} checks pass`;
+  $("vlist").innerHTML = checks.map(([k, x]) => `<li>${x === true ? "✓" : "✗"} ${k}</li>`).join("");
+
+  $("hubs").innerHTML = d.hubs.length ? d.hubs.map(h => {
+    const [c] = ZONE[h.k % ZONE.length];
+    return `<div class="hub"><span class="sw" style="background:${c}"></span>
+      <span class="rooms">H${h.k + 1} · ${h.rooms.join(", ")}</span><span class="j">${fmt(h.metrics.J)}</span>
+      <div class="bar"><i style="width:${Math.min(100, h.area)}%;background:${c}"></i></div>
+      <div class="meta"><span>${h.area.toFixed(1)} / 100 m²</span><span>${h.devices} / 5 devices</span><span>${h.method}</span></div></div>`;
+  }).join("") : `<div class="sub">No hubs placed.</div>`;
+
+  const notes = d.log.filter(Boolean);
+  $("logbox").hidden = !notes.length;
+  $("loglist").innerHTML = notes.map(s => `<li>${s}</li>`).join("");
+}
+
+// ---------- phases
+async function openPhases() {
+  if (!cur) return;
+  $("phases").hidden = false; $("phTitle").textContent = "Drawing the phases…";
+  $("phImg").removeAttribute("src"); $("phCount").textContent = "";
+  try {
+    const r = await api(`/api/phases/${cur.id}`);
+    phaseList = r.images; phaseIdx = 0;
+    $("phRange").max = Math.max(0, phaseList.length - 1);
+    showPhase(0);
+  } catch (e) { $("phTitle").textContent = "Could not draw phases: " + e.message; }
+}
+function showPhase(i) {
+  if (!phaseList.length) return;
+  phaseIdx = Math.max(0, Math.min(phaseList.length - 1, i));
+  const p = phaseList[phaseIdx];
+  $("phImg").src = p.url; $("phImg").alt = p.title;
+  $("phTitle").textContent = `Plan ${cur.id} · Phase ${p.title}`;
+  $("phRange").value = phaseIdx; $("phCount").textContent = `${phaseIdx + 1} / ${phaseList.length}`;
+}
+$("phasebtn").onclick = openPhases;
+$("phPrev").onclick = () => showPhase(phaseIdx - 1);
+$("phNext").onclick = () => showPhase(phaseIdx + 1);
+$("phRange").oninput = e => showPhase(Number(e.target.value));
+$("phClose").onclick = () => $("phases").hidden = true;
+$("phases").addEventListener("click", e => { if (e.target.id === "phases") $("phases").hidden = true; });
+addEventListener("keydown", e => {
+  if ($("phases").hidden) { if (e.key === "Enter" && document.activeElement === $("pid")) solve(); return; }
+  if (e.key === "ArrowRight") showPhase(phaseIdx + 1);
+  if (e.key === "ArrowLeft") showPhase(phaseIdx - 1);
+  if (e.key === "Escape") $("phases").hidden = true;
+});
+
+// ---------- controls
+$("solve").onclick = () => solve();
+$("rand").onclick = async () => solve((await api("/api/random")).id);
+function step(dir) {
+  if (!ids.length) return;
+  const v = Number($("pid").value);
+  let i = ids.findIndex(x => x >= v);
+  if (i < 0) i = ids.length - 1;
+  if (ids[i] === v || dir < 0) i += dir;
+  solve(ids[(i + ids.length) % ids.length]);
+}
+$("prev").onclick = () => step(-1); $("next").onclick = () => step(1);
+$("export").onclick = () => { if (cur) location.href = `/api/export/${cur.id}`; };
+document.querySelectorAll(".layers input").forEach(cb => cb.onchange = applyLayers);
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $("uphint").textContent = `Reading ${f.name}…`;
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    const r = await api("/api/upload", { method: "POST", body: fd });
+    $("uphint").textContent = `Added ${r.added} plan${r.added > 1 ? "s" : ""}.`;
+    await refreshDataset(); solve(r.ids[0]);
+  } catch (err) { $("uphint").textContent = err.message; }
+  e.target.value = "";
+};
+
+try {
+  const saved = JSON.parse(localStorage.getItem("crp-layers") || "null");
+  if (Array.isArray(saved)) document.querySelectorAll(".layers input").forEach((c, i) => { if (i in saved) c.checked = saved[i]; });
+  const last = localStorage.getItem("crp-last"); if (last) $("pid").value = last;
+} catch (e) {}
+refreshDataset().then(() => solve());
+</script>
+</body>
+</html>

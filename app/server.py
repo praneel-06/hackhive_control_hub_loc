@@ -1,0 +1,220 @@
+"""Local web UI for the hub-ring solver.
+
+Run:  .venv/bin/python -m uvicorn app.server:app --port 8000
+Then open http://localhost:8000
+
+The 300-plan sample is available at once; the full ResPlan.pkl (if present)
+loads in the background and is indexed by plan id. Plans can also be added by
+uploading a ResPlan-style .pkl (one plan dict or a list of them).
+"""
+from __future__ import annotations
+
+import pickle
+import random
+import sys
+import threading
+import time
+import warnings
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from shapely.geometry import MultiPolygon, Polygon
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
+warnings.filterwarnings("ignore")
+
+from hubring.groups import room_adjacency                      # noqa: E402
+from hubring.plan import RESPLAN_DIR, load_plans                # noqa: E402
+from hubring.solve import FALLBACK_LEVELS, solve_plan, to_json  # noqa: E402
+
+PHASE_DIR = ROOT / "out" / "ui_phases"
+PHASES = [
+    ("p0_input", "0 · Input plan"), ("p1_clean", "1 · Clean-up & free space"), ("p2_devices", "2 · Devices"),
+    ("p3_grid", "3 · Routing grid"), ("p3_door_zoom", "3 · Door lanes (zoom)"), ("p4_graph", "4 · Room graph"),
+    ("p5_zones", "5 · Candidate zones"), ("p6_leg", "6 · One leg"), ("p7_orders", "7 · Visiting orders"),
+    ("p7_loop", "7 · Loop: shortest vs collision-aware"), ("p8_hub", "8 · Hub on the loop"),
+    ("p9_final", "9 · Final answer"),
+]
+
+app = FastAPI(title="Cable Ring Planner")
+
+# ---------------------------------------------------------------- plan store
+PLANS: dict[int, dict] = {}
+SOURCE = {"sample": 0, "full": 0, "uploaded": 0, "full_loading": False, "full_error": None}
+_render_lock = threading.Lock()
+
+
+def _add(raws, kind):
+    for r in raws:
+        PLANS[int(r["id"])] = r
+    SOURCE[kind] += len(raws)
+
+
+_add(load_plans(), "sample")
+
+
+def _load_full():
+    path = RESPLAN_DIR / "ResPlan.pkl"
+    if not path.exists():
+        return
+    SOURCE["full_loading"] = True
+    try:
+        with open(path, "rb") as f:
+            _add(pickle.load(f), "full")
+    except Exception as e:                          # keep the UI usable on the sample
+        SOURCE["full_error"] = f"{type(e).__name__}: {e}"
+    SOURCE["full_loading"] = False
+
+
+threading.Thread(target=_load_full, daemon=True).start()
+
+
+# ---------------------------------------------------------------- geometry → JSON
+def _path(geom) -> str:
+    """SVG path data for a (multi)polygon in metres (holes as extra subpaths)."""
+    if geom is None or geom.is_empty:
+        return ""
+    polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+    out = []
+    for p in polys:
+        if not isinstance(p, Polygon) or p.is_empty:
+            continue
+        for ring in [p.exterior, *p.interiors]:
+            c = np.asarray(ring.coords)
+            out.append("M" + "L".join(f"{x:.3f},{y:.3f}" for x, y in c) + "Z")
+    return "".join(out)
+
+
+def _names(rooms) -> list[str]:
+    count = Counter(r.type for r in rooms)
+    seen = Counter()
+    names = []
+    for r in rooms:
+        seen[r.type] += 1
+        names.append(f"{r.type} {seen[r.type]}" if count[r.type] > 1 else r.type)
+    return names
+
+
+def _payload(raw: dict) -> dict:
+    t0 = time.perf_counter()
+    sol = solve_plan(raw)
+    solve_s = time.perf_counter() - t0
+    plan = sol.plan
+    names = _names(plan.rooms)
+    zone_of = {r: k for k, rg in enumerate(sol.rings) for r in rg.order}
+    grid = getattr(sol, "grid", None)
+    node_xy = grid.pts[grid.node_pt] if grid is not None else np.array([r.node for r in plan.rooms])
+    x0, y0, x1, y1 = plan.inner.bounds
+    for r in plan.rooms:
+        bx0, by0, bx1, by1 = r.poly.bounds
+        x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
+    out = {
+        "id": plan.id, "status": sol.status, "fallback": FALLBACK_LEVELS[sol.fallback],
+        "log": sol.log, "solve_s": solve_s, "scale": plan.scale,
+        "bounds": [x0, y0, x1, y1],
+        "rooms": [{"i": i, "id": r.id, "type": r.type, "name": names[i], "area": r.area,
+                   "path": _path(r.poly), "zone": zone_of.get(i),
+                   "node": [float(v) for v in node_xy[i]], "clearance": r.clearance}
+                  for i, r in enumerate(plan.rooms)],
+        "excluded": [{"id": n, "type": n.rsplit("_", 1)[0], "path": _path(g)} for n, g in plan.excluded],
+        "walls": _path(plan.walls), "windows": _path(plan.windows),
+        "doors": "".join(_path(d) for d in plan.doors),
+        "H": sol.H, "lower_bound": getattr(sol, "lower_bound", None),
+        "metrics": {"J": sol.total.J, "L": sol.total.L, "B": sol.total.B, "X": sol.total.X, "O": sol.total.O},
+        "checks": sol.checks, "valid": sol.valid,
+        "hubs": [{"k": k, "rooms": [names[i] for i in rg.order], "room_idx": list(rg.order),
+                  "ring": np.round(rg.ring, 3).tolist(), "hub": [float(v) for v in rg.hub],
+                  "method": rg.hub_method, "area": rg.group.area, "devices": len(rg.order),
+                  "metrics": {"J": rg.J, "L": rg.metrics.L, "B": rg.metrics.B, "X": rg.metrics.X, "O": rg.metrics.O}}
+                 for k, rg in enumerate(sol.rings)],
+        "grid": None, "graph": [],
+    }
+    if grid is not None:
+        seg = grid.pts[grid.edges]
+        out["grid"] = np.round(seg.reshape(len(seg), 4), 3).tolist()
+        adj = room_adjacency(plan, grid)
+        out["graph"] = [[int(u), int(v), d["via"]] for u, v, d in adj.edges(data=True)]
+    out["server_s"] = time.perf_counter() - t0
+    return out
+
+
+def _raw(pid: int) -> dict:
+    if pid not in PLANS:
+        msg = "still loading the full dataset, try again in a few seconds" if SOURCE["full_loading"] else "unknown plan id"
+        raise HTTPException(404, f"Plan {pid}: {msg}")
+    return PLANS[pid]
+
+
+# ---------------------------------------------------------------- API
+@app.get("/api/status")
+def status():
+    return {"plans": len(PLANS), **SOURCE}
+
+
+@app.get("/api/plans")
+def plans():
+    return {"ids": sorted(PLANS)}
+
+
+@app.get("/api/random")
+def random_plan():
+    return {"id": random.choice(list(PLANS))}
+
+
+@app.get("/api/solve/{pid}")
+def solve(pid: int):
+    return JSONResponse(_payload(_raw(pid)))
+
+
+@app.get("/api/export/{pid}")
+def export(pid: int):
+    sol = solve_plan(_raw(pid))
+    return JSONResponse(to_json(sol), headers={"Content-Disposition": f'attachment; filename="plan_{pid}_solution.json"'})
+
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    """A ResPlan-style pickle: one plan dict or a list of them. Pickle can run
+    code when loaded, so only upload files you trust (this is a local tool)."""
+    data = await file.read()
+    try:
+        obj = pickle.loads(data)
+    except Exception as e:
+        raise HTTPException(400, f"Could not read {file.filename}: {type(e).__name__}: {e}")
+    raws = obj if isinstance(obj, list) else [obj]
+    raws = [r for r in raws if isinstance(r, dict) and "id" in r and "inner" in r]
+    if not raws:
+        raise HTTPException(400, "No ResPlan plans found (expected dicts with 'id', 'inner', room polygons …)")
+    _add(raws, "uploaded")
+    return {"added": len(raws), "ids": [int(r["id"]) for r in raws][:200]}
+
+
+@app.get("/api/phases/{pid}")
+def phases(pid: int):
+    raw = _raw(pid)
+    d = PHASE_DIR / str(pid)
+    t0 = time.perf_counter()
+    if not (d / "p9_final.png").exists():
+        from walkthrough import render
+        with _render_lock:                          # matplotlib is not thread-safe
+            render(raw, d)
+    return {"seconds": time.perf_counter() - t0,
+            "images": [{"name": n, "title": t, "url": f"/phase-img/{pid}/{n}.png"}
+                       for n, t in PHASES if (d / f"{n}.png").exists()]}
+
+
+@app.get("/phase-img/{pid}/{name}.png")
+def phase_img(pid: int, name: str):
+    p = PHASE_DIR / str(pid) / f"{Path(name).name}.png"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p)
+
+
+app.mount("/", StaticFiles(directory=ROOT / "app" / "static", html=True), name="static")

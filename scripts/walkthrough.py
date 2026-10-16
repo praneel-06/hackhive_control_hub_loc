@@ -81,9 +81,21 @@ def finish(fig, ax, name, title):
 
 
 def main(pid: int):
-    OUT.mkdir(parents=True, exist_ok=True)
     raws = pickle.load(open(RESPLAN_DIR / "ResPlan.pkl", "rb"))
     raw = next(r for r in raws if r["id"] == pid)
+    example = next((r for r in raws if r["id"] == 13929), None)
+    facts = render(raw, OUT, orders_raw=example)
+    print(json.dumps(facts, indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))[:6000])
+
+
+def render(raw: dict, out_dir: Path, orders_raw: dict | None = None) -> dict:
+    """Draw every phase of one plan into out_dir (p0_input.png … p9_final.png).
+    orders_raw: plan for the 5-device visiting-order example; default = this
+    plan when it has a zone of 4+ devices, else no order picture."""
+    global OUT
+    OUT = Path(out_dir)
+    OUT.mkdir(parents=True, exist_ok=True)
+    pid = raw["id"]
     facts: dict = {"plan_id": pid}
 
     # ---- Phase 0: raw input (drawing units) ---------------------------------------------
@@ -126,7 +138,7 @@ def main(pid: int):
               ["free space (cable allowed)", "excluded room (no device, no cable)"],
               loc="upper left", bbox_to_anchor=(1, 1), fontsize=8, frameon=False)
     finish(fig, ax, "p1_clean", f"Phase 1 · Clean-up: metres (scale {plan.scale:.2f} units/m), "
-           f"5 eligible rooms = {facts['p1']['eligible_area']:.1f} m²")
+           f"{len(plan.rooms)} eligible rooms = {facts['p1']['eligible_area']:.1f} m²")
 
     # ---- Phase 2: devices ---------------------------------------------------------------
     fig, ax = plt.subplots(figsize=(7, 6.4))
@@ -244,6 +256,19 @@ def main(pid: int):
 
     # ---- Phase 6: one leg on the heading-state graph -------------------------------------
     big = max(useful, key=lambda g: (g.n_devices, g.area))
+    if big.n_devices >= 2:
+        _legs_and_loop(plan, grid, big, facts)
+    _hub(plan, grid, big, facts)
+    _final(raw, plan, grid, useful, partitions, facts)
+    if orders_raw is not None:
+        facts["orders_example"] = orders_example(orders_raw)
+    elif big.n_devices >= 4:
+        facts["orders_example"] = orders_example(raw)
+    json.dump(facts, open(OUT / "facts.json", "w"), indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+    return facts
+
+
+def _legs_and_loop(plan, grid, big, facts):
     rt = route_table(grid, allowed=zone_allowed(grid, big.rooms), nodes=np.array(big.rooms))
     a, b = 0, 1
     cost, s, e = rt.best(a, b)
@@ -287,8 +312,14 @@ def main(pid: int):
                  fontsize=11, x=0.01, ha="left")
     fig.tight_layout(); fig.savefig(OUT / "p7_loop.png", dpi=150, bbox_inches="tight", facecolor="white"); plt.close(fig)
 
+
+def _hub(plan, grid, big, facts):
     # ---- Phase 8: hub on the loop -------------------------------------------------------
+    if not big.loops:
+        best_loops(big, grid)
     rg = place_hub(plan, grid, big)
+    if rg is None:
+        return
     region = hub_region(plan, big, grid.pts[grid.node_pt])
     fig, ax = plt.subplots(figsize=(7, 6.4))
     base(ax, plan, labels=False, alpha=0.45)
@@ -305,6 +336,8 @@ def main(pid: int):
            f"(J stays {rg.J:.2f})")
     facts["p8"] = {"hub": [round(v, 2) for v in rg.hub], "method": rg.hub_method, "J": rg.J}
 
+
+def _final(raw, plan, grid, useful, partitions, facts):
     # ---- Phase 9: choose zones (DP) + final ---------------------------------------------
     sol = solve_plan(raw)
     rings = {}
@@ -334,17 +367,13 @@ def main(pid: int):
         ax.annotate(f"H{k + 1}", rg_.hub, ha="center", va="center", color="white", fontsize=8, weight="bold", zorder=9)
     finish(fig, ax, "p9_final", f"Phase 9 · Final answer: {sol.H} hubs, J = {sol.total.J:.2f} "
            f"(L {sol.total.L:.2f} m, bends {sol.total.B}, crossings {sol.total.X}, overlap {sol.total.O:.2f} m)")
-    facts["orders_example"] = orders_example(raws)
-    out_json = to_json(sol)
-    json.dump(out_json, open(OUT / "solution.json", "w"), indent=1, default=float)
-    json.dump(facts, open(OUT / "facts.json", "w"), indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
-    print(json.dumps(facts, indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))[:6000])
+    json.dump(to_json(sol), open(OUT / "solution.json", "w"), indent=1, default=float)
 
 
-def orders_example(raws, pid=13929):
-    """A 5-device zone: score every visiting order (heading DP), draw best and worst."""
+def orders_example(raw):
+    """The plan's biggest zone: score every visiting order (heading DP), draw best and worst."""
     from hubring.loops import heading_dp, _legs_for
-    raw = next(r for r in raws if r["id"] == pid)
+    pid = raw["id"]
     plan = build_plan(raw)
     grid = G.build_grid(plan)
     adj = room_adjacency(plan, grid)
@@ -369,7 +398,7 @@ def orders_example(raws, pid=13929):
             ax.annotate(f"N{j}", (x, y), ha="center", va="center", color="white", fontsize=7, weight="bold", zorder=8)
         ax.set_aspect("equal"); ax.set_axis_off()
         ax.set_title(f"{name}: L + 0.5·bends = {cost:.2f}", fontsize=10, loc="left")
-    fig.suptitle(f"Visiting orders for a 5-device zone (plan {pid}): {len(scored)} orders scored, cheapest wins",
+    fig.suptitle(f"Visiting orders for a {k}-device zone (plan {pid}): {len(scored)} orders scored, cheapest wins",
                  fontsize=11, x=0.01, ha="left")
     fig.tight_layout(); fig.savefig(OUT / "p7_orders.png", dpi=150, bbox_inches="tight", facecolor="white"); plt.close(fig)
     return {"plan": pid, "zone": g.room_ids, "n_orders": len(scored), "costs": [round(c, 2) for c, _, _ in scored]}
