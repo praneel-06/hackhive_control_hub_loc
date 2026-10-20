@@ -28,6 +28,16 @@ Progress over the last day:
 - **Speed:** full dataset 580 s → 222 s on 8 cores (building rings only for zones that can be in a fewest-hub answer; direct hubs for one-device zones).
 - **Cost:** after a finer grid, every visiting order and multi-pass rip-up-and-reroute, total J on the full dataset 755,606 → 689,099 (−8.8%), crossings 4,467 → 661, and 19 plans need one hub fewer. Solving is slower again (550 s), still 0.14 s per plan at the median.
 
+## Key idea: devices first, hub last
+
+Moving the hub anywhere along a finished ring leaves J unchanged. A hub on a
+straight stretch splits one segment into two collinear pieces: +0 m, +0 bends,
+and crossings and overlap are untouched. So the solver never searches for hub
+positions. It builds the cheapest closed loop through each zone's devices,
+then drops the hub on the longest straight stretch inside the allowed area.
+That removes the per-point hub scan entirely, which is what makes the
+full dataset run in minutes.
+
 ## How it works
 
 A phase-by-phase walkthrough with a diagram per phase is in
@@ -119,3 +129,7 @@ Feature scan of random plans: `scripts/edge_scan.py N`.
 Plots and JSON go to `out/` (git-ignored).
 
 `archive (1)/` holds ResPlan's own utilities (`resplan_utils.py`, MIT) and docs.
+
+## Team
+
+**Git Push and Pray**: Praneel Chetlapalli, Abhinav Botlaguduru, Harsha Anaparthi.
